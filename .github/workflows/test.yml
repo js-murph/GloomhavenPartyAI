@@ -1,0 +1,22 @@
+name: Pure Regression Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dotnet: ['8.0', '10.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '${{ matrix.dotnet }}.x'
+      - name: Run dependency-free regression tests
+        run: dotnet run --project tests/RegressionTests.csproj --configuration Release -p:RegressionTargetFramework=net${{ matrix.dotnet }}

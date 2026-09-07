@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RegressionTargetFramework Condition="'$(RegressionTargetFramework)' == ''">net8.0</RegressionTargetFramework>
+    <TargetFramework>$(RegressionTargetFramework)</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <Compile Include="../TacticalEvaluation.cs" Link="TacticalEvaluation.cs" />
+    <Compile Include="../ItemEvaluation.cs" Link="ItemEvaluation.cs" />
+    <Compile Include="../DiagnosticJson.cs" Link="DiagnosticJson.cs" />
+  </ItemGroup>
+</Project>
