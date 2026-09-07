@@ -1,0 +1,14 @@
+# Build outputs contain machine-specific paths and are not source artifacts.
+bin/
+obj/
+
+# IDE and user-specific files.
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+
+# OS metadata.
+.DS_Store
+Thumbs.db

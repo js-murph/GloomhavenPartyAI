@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <AssemblyName>GloomhavenPartyAI</AssemblyName>
+    <RootNamespace>GloomhavenPartyAI</RootNamespace>
+    <PartyAIVersion>0.3.2</PartyAIVersion>
+    <Version>$(PartyAIVersion)</Version>
+    <AssemblyVersion>$(PartyAIVersion).0</AssemblyVersion>
+    <FileVersion>$(PartyAIVersion).0</FileVersion>
+    <InformationalVersion>$(PartyAIVersion)</InformationalVersion>
+    <GameRoot Condition="'$(GameRoot)' == ''">$(GLOOMHAVEN_GAME_ROOT)</GameRoot>
+    <ManagedDir>$(GameRoot)/GH_Data/Managed</ManagedDir>
+    <BepInExCore Condition="'$(BepInExCore)' == '' and '$(BEPINEX_CORE)' != ''">$(BEPINEX_CORE)</BepInExCore>
+    <BepInExCore Condition="'$(BepInExCore)' == '' and '$(GameRoot)' != ''">$(GameRoot)/BepInEx/core</BepInExCore>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <Target Name="ValidateExternalReferences" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="'$(GameRoot)' == ''" Text="Set GameRoot or GLOOMHAVEN_GAME_ROOT to a Gloomhaven installation." />
+    <Error Condition="!Exists('$(ManagedDir)/ScenarioRuleLibrary.dll')" Text="ScenarioRuleLibrary.dll was not found under $(ManagedDir)." />
+    <Error Condition="!Exists('$(BepInExCore)/BepInEx.dll')" Text="BepInEx.dll was not found under $(BepInExCore). Install BepInEx 5 or set BepInExCore/BEPINEX_CORE." />
+  </Target>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
+
+    <Reference Include="BepInEx" HintPath="$(BepInExCore)/BepInEx.dll" Private="false" />
+    <Reference Include="0Harmony" HintPath="$(BepInExCore)/0Harmony.dll" Private="false" />
+    <Reference Include="GH.Runtime" HintPath="$(ManagedDir)/GH.Runtime.dll" Private="false" />
+    <Reference Include="ScenarioRuleLibrary" HintPath="$(ManagedDir)/ScenarioRuleLibrary.dll" Private="false" />
+    <Reference Include="SharedLibrary" HintPath="$(ManagedDir)/SharedLibrary.dll" Private="false" />
+    <Reference Include="UnityEngine" HintPath="$(ManagedDir)/UnityEngine.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(ManagedDir)/UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.UI" HintPath="$(ManagedDir)/UnityEngine.UI.dll" Private="false" />
+    <Reference Include="UnityEngine.UIModule" HintPath="$(ManagedDir)/UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="Unity.TextMeshPro" HintPath="$(ManagedDir)/Unity.TextMeshPro.dll" Private="false" />
+  </ItemGroup>
+</Project>
