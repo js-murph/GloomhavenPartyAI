@@ -1,15 +1,14 @@
 # Gloomhaven Party AI
 
-An offline-only BepInEx mod for Gloomhaven Digital that lets each mercenary be controlled manually or by conservative tactical automation without changing actor allegiance.
+Choose which mercenaries you control in an offline Gloomhaven Digital scenario and let the mod play the others. Gloomhaven Party AI is a BepInEx plugin that selects cards and automates a limited set of movement, attack, healing, rest, and damage decisions. You can switch each living mercenary between manual and automated control from the initiative track.
 
 This is an unofficial community project. It is not affiliated with or endorsed by Flaming Fowl Studios, Twin Sails Interactive, Cephalofair Games, or the BepInEx project. A legally obtained copy of Gloomhaven Digital is required; no game files are distributed in this repository or its releases.
 
-## Safety and scope
+## Limits
 
-- All automation is disabled and its controls are hidden in online games.
+- The mod does not automate online games, and its controls are hidden while a game is online.
 - The mod does not change actor type, ownership, or allegiance.
-- Each living mercenary has an `AI ON` / `AI OFF` control on its initiative-track entry during an offline scenario.
-- Unsupported abilities and mandatory choices remain under manual control rather than being guessed.
+- The current planner handles simple Move abilities, including Jump and Fly when otherwise supported, single-target enemy attacks, and simple self or ally heals. It uses universal actions or waits for manual input when it cannot resolve a printed action.
 - Toggle overrides last only for the current scenario and reset when the scenario stops or reloads.
 
 ## Installation
@@ -51,29 +50,27 @@ After the first successful launch, edit:
 
 `BepInEx/config/com.jsm.gloomhaven.partyai.cfg`
 
-Set `HumanCharacter` to the campaign name or class ID of the mercenary that should start under manual control. If it is empty or does not match, the first mercenary seen when the scenario loads remains manual.
+Set `HumanCharacter` to the in-game name or internal class ID of the mercenary that should start under manual control. Matching is case-insensitive. If the setting is empty or does not match, the first mercenary in the scenario player list starts under manual control. You can change that initial assignment with the scenario controls.
 
-Other settings control the decision delay, decision logging, damage automation, and whether bots lose cards to prevent lethal damage. Setting `Enabled = false` disables all mod behavior without uninstalling it.
+Other settings control the decision delay, decision logging, damage automation, and whether bots lose cards to prevent lethal damage. Setting `Enabled = false` disables automation and per-mercenary toggling without unloading the plugin. In an offline scenario, the controls remain visible but disabled.
 
-During an offline scenario, click a mercenary's initiative-track control to toggle automation. With a controller, focus the initiative track and press Down from that mercenary's portrait. Enabling AI while a supported card, action, movement, attack, heal, or damage prompt is open resumes automation after the configured delay.
+During an offline scenario, click a mercenary's `AI ON` / `AI OFF` control on the initiative track to toggle automation. With a controller, focus the initiative track and press Down from that mercenary's portrait. Enabling AI can resume a supported open prompt after the configured delay. Damage prompts resume only when `AutomateDamage` is enabled.
 
-## Current behavior
+## How automation works
 
-- The configured human mercenary starts manual; other mercenaries start automated.
+- When enabled in an offline scenario, the configured human mercenary starts manual and the others start automated.
 - Switching AI off cancels delayed, uncommitted decisions. A choice already submitted to the game finishes before manual control resumes.
-- Bots score complete card pairs for damage, emergency healing, movement, loss-card stamina cost, flexibility, and initiative coverage.
-- Bots act faster when an enemy is close or health is low, and slower when immediate pressure is low.
-- After cards are revealed, bots compare both legal top/bottom orientations and both action orders.
-- Supported printed actions contain only ordinary Move, one-target enemy Attack, and simple finite-target self/ally Heal abilities. Universal Move 2 and Attack 2 remain legal fallbacks.
-- Movement uses the player movement state machine, considers legal stopping hexes, preserves useful ranged distance, and penalizes exposure to nearby enemies.
-- When no useful enemy-directed destination exists, bots approach the nearest safely reachable unlocked closed door and open it through normal movement. They never plan through another closed door or an unrevealed room.
-- Attacks account for shields, Pierce, overkill, disabling conditions, target threat, and whether a kill prevents an enemy activation.
-- Heals prioritize survival at 40% health or below and Poison or Wound removal. Routine and overhealing are discounted, and a second healing half normally becomes its universal action unless an emergency remains.
-- Bots long-rest when fewer than two cards remain in hand and lose the card with the lowest estimated future tactical value.
-- Bots accept ordinary damage and lose the lowest-value available card or cards to prevent lethal damage when possible.
+- Bots score card pairs based on likely attacks, useful movement, urgent healing, the future-turn cost of loss actions, flexibility, and initiative spread.
+- From the selected pair, bots choose the lower initiative when the nearest hostile is within three hexes or the acting mercenary's health is at most 50%. Otherwise, they choose the higher initiative.
+- After cards are revealed, bots compare supported top/bottom orientations and both action orders. A printed half is supported only when it consists of a simple Move, a single-target enemy Attack, or simple finite-target self/ally Heal abilities. Unsupported printed halves use a universal Move 2 or Attack 2 when available; prompts that still require unsupported input remain manual.
+- Movement uses the player movement state machine and considers valid stopping hexes. Bots stay put when a follow-up target is already in range. Otherwise, they penalize proximity to hostiles when comparing destinations that allow an attack.
+- If enemy-focused movement has no usable destination, bots approach the nearest eligible unlocked closed door. Entrances, exits, blocked doors, intact doors with health, and occupied door tiles are excluded. The route stays on revealed tiles and does not cross another closed door. Route search prefers paths that avoid traps but can retry without requiring the pathfinder to avoid them.
+- Attacks account for shields, Pierce, overkill, disabling conditions, target maximum health, whether the target has already acted, and whether a kill prevents an enemy activation.
+- Heals prioritize survival at 40% health or below and Poison or Wound removal. Routine healing and overhealing are discounted. The planner discourages a routine second heal and may choose the universal action instead; a second emergency heal remains eligible.
+- At a fresh card-selection prompt, bots long-rest when fewer than two cards remain in hand and at least two cards are discarded. They lose the discarded card with the lowest estimated future tactical value.
+- With `AutomateDamage` enabled, bots accept nonlethal damage. With `PreventLethalDamage` also enabled, they lose the lowest-scored hand card if available, or the two lowest-scored discarded cards, to prevent lethal damage when possible.
 - Optional additional attack targets are declined by the baseline automation.
-
-Unsupported area attacks, summons, forced movement, persistent bonuses, element consumes, dynamic values, conditional abilities, special class mechanics, and mandatory item or active-bonus choices remain manual.
+- Unsupported area attacks, summons, forced movement, persistent bonuses, element consumes, dynamic values, conditional abilities, and special class mechanics are not planned. Mandatory item or active-bonus choices require manual input.
 
 ## Build
 
@@ -97,11 +94,11 @@ dotnet build -c Release \
   -p:BepInExCore="/path/to/BepInEx/core"
 ```
 
-The equivalent `GLOOMHAVEN_GAME_ROOT` and `BEPINEX_CORE` environment variables are also supported. Game and BepInEx assemblies are referenced only from these local directories and must not be committed.
+The equivalent `GLOOMHAVEN_GAME_ROOT` and `BEPINEX_CORE` environment variables are also supported. These dependencies stay local; do not commit game or BepInEx assemblies.
 
 ## Releases
 
-GitHub-hosted runners cannot build the plugin without proprietary Gloomhaven assemblies. The tag-driven release workflow therefore publishes the reviewed plugin binary tracked at `artifacts/GloomhavenPartyAI.dll` rather than distributing game dependencies.
+The release workflow does not build the plugin because the required local Gloomhaven assemblies are not available on the GitHub runner. Instead, it packages the plugin binary tracked at `artifacts/GloomhavenPartyAI.dll`. Game dependencies are not included.
 
 To publish a version:
 
@@ -110,26 +107,26 @@ To publish a version:
 3. Replace `artifacts/GloomhavenPartyAI.dll` with the new build and commit it with the source changes.
 4. Create and push a matching `vX.Y.Z` tag.
 
-The workflow rejects mismatched versions and publishes the DLL, an install-ready ZIP, generated release notes, and SHA-256 checksums.
+The workflow requires the tag, `Plugin.Version`, and `PartyAIVersion` to match. It also checks that the tracked DLL contains the release version string before publishing the DLL, an install-ready ZIP, generated release notes, and SHA-256 checksums.
 
 ## Runtime checks
 
-Use a disposable offline scenario before relying on a campaign save:
+To smoke-test current behavior, run these checks in a disposable offline scenario:
 
-1. Confirm each living mercenary has the correct initial `AI ON` or `AI OFF` label and the configured mercenary remains manual.
-2. Toggle each mercenary with mouse and controller input, then verify switching AI on at an open prompt resumes automation.
+1. Confirm each living mercenary has the correct initial `AI ON` or `AI OFF` label and the configured mercenary starts in manual mode.
+2. Toggle each mercenary with mouse and controller input, then verify switching AI on at a supported open prompt resumes automation. Enable `AutomateDamage` when checking a damage prompt.
 3. Switch AI off during delayed card, action, movement, attack, heal, and damage decisions; each prompt should remain manually usable.
-4. Confirm bots select exactly two cards, log pair/initiative decisions, and play supported actions through the normal card UI.
+4. With `LogDecisions` enabled, confirm bots select exactly two cards, log pair and initiative decisions, and play supported actions through the normal card UI.
 5. Exercise default and printed melee/ranged attacks, including universal multipass Attack 2.
 6. Exercise ordinary, Jump, and Fly movement and verify the bot ends only on legal hexes.
-7. Clear a room with an unlocked closed door both within and beyond the current Move. Verify the bot opens it normally or advances toward it without crossing another closed door or unrevealed tile.
-8. Test heals above and below 40% health, at full health, Poisoned, Wounded, and affected by Block Healing. Verify routine double-heal turns use a universal second action while a still-critical target can receive another heal.
-9. Test Target 2 heals and optional abilities with no useful target; they should pass without a stuck prompt.
+7. Clear a room with an eligible unlocked closed door both within and beyond the current Move. Verify the bot opens it normally or advances toward it without crossing another closed door or unrevealed tile.
+8. Test heals above and below 40% health, at full health, Poisoned, Wounded, and affected by Block Healing. Exercise routine and emergency double-heal cases and record the selected second action; routine second heals are penalized rather than prohibited.
+9. Test Target 2 heals, supported attacks with no target, and skippable heals with no useful target; they should pass without a stuck prompt.
 10. Confirm long rests, lethal-damage card loss, exhaustion, toggle reset after scenario reload, and normal manual handoff.
-11. Check `BepInEx/LogOutput.log` for `[Decision]`, Harmony, or `Party AI decision failed` entries.
+11. Review `BepInEx/LogOutput.log` for `[Decision]`, Harmony, or `Party AI decision failed` entries.
 
-## Validation status
+## Manual validation
 
-The `0.1.0` baseline completed a two-mercenary offline scenario smoke test. The `0.2.0` build added per-mercenary controls. The `0.3.0` build added printed Move, Attack, and Heal planning and corrected the synchronous damage-response scheduler. Runtime testing exposed a stale Ready-button callback after automated long rests; `0.3.1` clears that callback and guards card-selection UI readiness. `0.3.2` corrects pre-start movement scoring, shifts healing toward emergencies, suppresses routine double-heal turns, and adds safe closed-door progression.
+The release workflow checks version fields and creates the release packages; it does not run automated or in-game tests. The maintainer reports completing a two-mercenary offline smoke test for `0.1.0` and manually exercising core tactical action execution in a later build.
 
-Core tactical action execution has been exercised in a live scenario. The `0.3.2` healing and door changes plus toggle timing, lethal-damage prevention, exhaustion, and scenario reload still need targeted runtime coverage.
+Targeted runtime evidence is not yet available for the `0.3.2` healing and door changes, toggle timing, lethal-damage prevention, exhaustion, or scenario reload.
