@@ -1,4 +1,4 @@
-# Developing Competent Party AI
+# Developing Party AI
 
 The v0.4.0 development build addresses baseline tactical mistakes and adds evidence collection. It is not a claim that the AI can complete arbitrary scenarios or play every class well. Actual game testing remains with the user; the work below was built and checked without launching Gloomhaven or changing its installed plugin.
 
