@@ -4,7 +4,7 @@
     <LangVersion>7.3</LangVersion>
     <AssemblyName>GloomhavenPartyAI</AssemblyName>
     <RootNamespace>GloomhavenPartyAI</RootNamespace>
-    <PartyAIVersion>0.3.2</PartyAIVersion>
+    <PartyAIVersion>0.4.0</PartyAIVersion>
     <Version>$(PartyAIVersion)</Version>
     <AssemblyVersion>$(PartyAIVersion).0</AssemblyVersion>
     <FileVersion>$(PartyAIVersion).0</FileVersion>
@@ -23,6 +23,7 @@
   </Target>
 
   <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
 
     <Reference Include="BepInEx" HintPath="$(BepInExCore)/BepInEx.dll" Private="false" />

@@ -2,6 +2,36 @@ using GloomhavenPartyAI;
 
 internal static class TacticalTests
 {
+    internal static void CopiedActionIdentityPreservesOnlyTheCommittedHalf()
+    {
+        Guid original = Guid.NewGuid();
+        Guid copiedId = new Guid(original.ToByteArray());
+        Check.True(TacticalEvaluation.MatchesCommittedAction(original, copiedId, 2, 2),
+            "the game copies actions while preserving their ID");
+        Check.True(!TacticalEvaluation.MatchesCommittedAction(original, copiedId, 2, 3),
+            "a different selected half must not retain the plan");
+        Check.True(!TacticalEvaluation.MatchesCommittedAction(original, Guid.NewGuid(), 2, 2),
+            "a different action must not retain the plan");
+        Check.True(!TacticalEvaluation.MatchesCommittedAction(original, null, 2, 2),
+            "uncommitted action has no followup");
+        Check.True(!TacticalEvaluation.MatchesCommittedAction(Guid.Empty, Guid.Empty, 2, 2),
+            "missing IDs do not establish action identity");
+    }
+
+    internal static void MovementCacheKeysDistinguishEveryRuleCombination()
+    {
+        var keys = new HashSet<int>();
+        for (int flags = 0; flags < 64; flags++)
+        {
+            int key = TacticalEvaluation.MovementRulesKey((flags & 1) != 0, (flags & 2) != 0,
+                (flags & 4) != 0, (flags & 8) != 0, (flags & 16) != 0, (flags & 32) != 0);
+            Check.True(keys.Add(key), $"movement rules collide for flags={flags}");
+            Check.Equal(key, TacticalEvaluation.MovementRulesKey((flags & 1) != 0, (flags & 2) != 0,
+                (flags & 4) != 0, (flags & 8) != 0, (flags & 16) != 0, (flags & 32) != 0),
+                "equivalent movement rules reuse the cache key");
+        }
+    }
+
     internal static void ZeroDamageAndDeadTargetsHaveNoAttackValue()
     {
         foreach (bool acted in new[] { false, true })

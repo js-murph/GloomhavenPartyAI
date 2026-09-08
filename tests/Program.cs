@@ -4,6 +4,8 @@ internal static class Program
     {
         Action[] tests =
         [
+            TacticalTests.CopiedActionIdentityPreservesOnlyTheCommittedHalf,
+            TacticalTests.MovementCacheKeysDistinguishEveryRuleCombination,
             TacticalTests.ZeroDamageAndDeadTargetsHaveNoAttackValue,
             TacticalTests.EffectiveDamageAndKillTiming,
             TacticalTests.AttackStrengthIsMonotonicAndOverkillIsHarmless,

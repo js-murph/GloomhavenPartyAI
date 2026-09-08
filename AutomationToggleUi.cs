@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Linq;
 using ScenarioRuleLibrary;
 using Script.GUI.SMNavigation.Utils;
 using TMPro;
@@ -12,9 +14,26 @@ namespace GloomhavenPartyAI
         private const string ControlName = "GloomhavenPartyAI.Toggle";
         private static readonly Color AutomatedColor = new Color(0.12f, 0.36f, 0.24f, 0.96f);
         private static readonly Color ManualColor = new Color(0.25f, 0.22f, 0.19f, 0.96f);
+        private static readonly Color WaitingColor = new Color(0.48f, 0.30f, 0.09f, 0.96f);
         private static readonly Color BorderColor = new Color(0.78f, 0.63f, 0.34f, 1f);
+        private static readonly HashSet<InitiativeTrackPlayerBehaviour> ExistingPlayers = new HashSet<InitiativeTrackPlayerBehaviour>();
 
         internal static void Refresh(InitiativeTrackPlayerBehaviour playerUi)
+        {
+            Refresh(playerUi, create: true);
+        }
+
+        // Poll only controls encountered by the existing initiative-track patch, including hidden ones.
+        internal static void RefreshAll()
+        {
+            foreach (InitiativeTrackPlayerBehaviour playerUi in ExistingPlayers.ToArray())
+            {
+                if (playerUi == null) ExistingPlayers.Remove(playerUi);
+                else Refresh(playerUi, create: false);
+            }
+        }
+
+        private static void Refresh(InitiativeTrackPlayerBehaviour playerUi, bool create)
         {
             CPlayerActor actor = playerUi?.Actor as CPlayerActor;
             if (actor == null)
@@ -23,7 +42,9 @@ namespace GloomhavenPartyAI
             }
 
             Transform existing = playerUi.transform.Find(ControlName);
+            if (existing == null && !create) return;
             GameObject control = existing == null ? Create(playerUi) : existing.gameObject;
+            ExistingPlayers.Add(playerUi);
             bool visible = !FFSNetwork.IsOnline && !actor.IsDead;
             if (!visible && EventSystem.current != null &&
                 EventSystem.current.currentSelectedGameObject == control)
@@ -42,11 +63,14 @@ namespace GloomhavenPartyAI
             Button button = control.GetComponent<Button>();
             TextMeshProUGUI label = control.GetComponentInChildren<TextMeshProUGUI>(includeInactive: true);
             bool automated = AutomationController.IsAutomated(actor);
+            bool waiting = automated && AutomationController.NeedsInput(actor);
             Image image = control.GetComponent<Image>();
-            image.color = automated ? AutomatedColor : ManualColor;
-            label.text = automated ? "AI ON" : "AI OFF";
+            image.color = waiting ? WaitingColor : automated ? AutomatedColor : ManualColor;
+            label.text = waiting ? "AI WAIT" : automated ? "AI ON" : "AI OFF";
             label.color = automated ? Color.white : new Color(0.88f, 0.82f, 0.7f, 1f);
             button.interactable = AutomationController.CanToggleAutomation() && !actor.IsDead;
+
+            if (!create) return;
 
             string actorGuid = actor.ActorGuid;
             button.onClick.RemoveAllListeners();
