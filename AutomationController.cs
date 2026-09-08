@@ -3,7 +3,6 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using HarmonyLib;
 using ScenarioRuleLibrary;
 using UnityEngine;
@@ -14,20 +13,20 @@ namespace GloomhavenPartyAI
     {
         private readonly struct DecisionKey : IEquatable<DecisionKey>
         {
-            internal readonly object Token;
+            internal readonly bool Damage;
             internal readonly string ActorGuid;
             internal readonly int ActorEpoch;
 
-            internal DecisionKey(object token, string actorGuid, int actorEpoch)
+            internal DecisionKey(bool damage, string actorGuid, int actorEpoch)
             {
-                Token = token;
+                Damage = damage;
                 ActorGuid = actorGuid;
                 ActorEpoch = actorEpoch;
             }
 
             public bool Equals(DecisionKey other)
             {
-                return ReferenceEquals(Token, other.Token) && ActorGuid == other.ActorGuid &&
+                return Damage == other.Damage && ActorGuid == other.ActorGuid &&
                     ActorEpoch == other.ActorEpoch;
             }
 
@@ -38,20 +37,38 @@ namespace GloomhavenPartyAI
 
             public override int GetHashCode()
             {
-                int hash = (RuntimeHelpers.GetHashCode(Token) * 397) ^ (ActorGuid?.GetHashCode() ?? 0);
+                int hash = (Damage.GetHashCode() * 397) ^ (ActorGuid?.GetHashCode() ?? 0);
                 return (hash * 397) ^ ActorEpoch;
             }
         }
 
+        private sealed class PromptStamp
+        {
+            internal object Token;
+            internal string State;
+            internal bool NeedsInput;
+
+            internal bool Matches(PromptStamp other)
+            {
+                return other != null && ReferenceEquals(Token, other.Token) && State == other.State;
+            }
+        }
+
+        private const float WaitTimeoutSeconds = 15f;
+        private const float UiTimeoutSeconds = 3f;
         private static Plugin _plugin;
         private static string _humanActorGuid;
         private static readonly object StateLock = new object();
         private static readonly HashSet<DecisionKey> PendingDecisions = new HashSet<DecisionKey>();
+        private static readonly Dictionary<string, PromptStamp> SettledPrompts = new Dictionary<string, PromptStamp>();
+        private static readonly Dictionary<string, PromptStamp> ItemAttempts = new Dictionary<string, PromptStamp>();
+        private static readonly HashSet<string> ItemSubmitted = new HashSet<string>();
         private static readonly HashSet<string> ForcedManualActors = new HashSet<string>();
         private static readonly HashSet<string> ForcedAutomatedActors = new HashSet<string>();
         private static readonly Dictionary<string, int> ActorEpochs = new Dictionary<string, int>();
         private static readonly Dictionary<string, CPlayerSelectingToAvoidDamageOrNot_MessageData> DamagePrompts =
             new Dictionary<string, CPlayerSelectingToAvoidDamageOrNot_MessageData>();
+        private static readonly Dictionary<string, object> DamageOperations = new Dictionary<string, object>();
         private static readonly HashSet<CAbilityAttack> CommittedAttacks = new HashSet<CAbilityAttack>();
         private static readonly FieldInfo ActionTopCard = AccessTools.Field(typeof(CardsActionControlller), "topCard");
         private static readonly FieldInfo ActionBottomCard = AccessTools.Field(typeof(CardsActionControlller), "bottomCard");
@@ -69,10 +86,14 @@ namespace GloomhavenPartyAI
             {
                 _humanActorGuid = null;
                 PendingDecisions.Clear();
+                SettledPrompts.Clear();
+                ItemAttempts.Clear();
+                ItemSubmitted.Clear();
                 ForcedManualActors.Clear();
                 ForcedAutomatedActors.Clear();
                 ActorEpochs.Clear();
                 DamagePrompts.Clear();
+                DamageOperations.Clear();
                 CommittedAttacks.Clear();
                 _onlineWarningLogged = false;
                 _generation++;
@@ -92,6 +113,15 @@ namespace GloomhavenPartyAI
             {
                 return IsAutomatedByState(player.ActorGuid);
             }
+        }
+
+        // Read-only lookup for diagnostics; do not register the party while taking a snapshot.
+        internal static bool? AutomationState(CActor actor)
+        {
+            if (!(actor is CPlayerActor) || string.IsNullOrEmpty(actor.ActorGuid)) return null;
+            if (Plugin.ModEnabled == null || !Plugin.ModEnabled.Value || FFSNetwork.IsOnline) return false;
+            lock (StateLock)
+                return string.IsNullOrEmpty(_humanActorGuid) ? (bool?)null : IsAutomatedByState(actor.ActorGuid);
         }
 
         internal static bool ToggleAutomation(CPlayerActor actor)
@@ -118,9 +148,12 @@ namespace GloomhavenPartyAI
                 }
 
                 ActorEpochs[actor.ActorGuid] = GetActorEpochByState(actor.ActorGuid) + 1;
+                ClearPromptState(actor);
                 enabled = !currentlyEnabled;
             }
 
+            TacticalPlanner.InvalidatePlan(actor);
+            Record("toggle", actor, "action=toggle;reason=user_toggle;enabled=" + (enabled ? "1" : "0"));
             Decision(Describe(actor) + " AI toggled " +
                 (enabled ? "on." : "off; manual control resumes at the next uncommitted prompt."));
             if (enabled)
@@ -164,6 +197,9 @@ namespace GloomhavenPartyAI
 
         internal static void HandleMessage(CMessageData message)
         {
+            // Keep an open damage prompt resumable even if automation was disabled when it arrived.
+            if (!FFSNetwork.IsOnline && message is CPlayerSelectingToAvoidDamageOrNot_MessageData damagePrompt)
+                HandleDamageMessage(damagePrompt);
             if (!CanAutomate() || message == null)
             {
                 return;
@@ -171,6 +207,13 @@ namespace GloomhavenPartyAI
 
             switch (message.m_Type)
             {
+                case CMessageData.MessageType.Undo:
+                case CMessageData.MessageType.RestartRound:
+                    foreach (CPlayerActor player in ScenarioManager.Scenario?.PlayerActors.ToList() ?? new List<CPlayerActor>())
+                    {
+                        NotifyManualAction(player);
+                    }
+                    break;
                 case CMessageData.MessageType.PlayerToSelectAbilityCardsOrLongRest:
                     EnsurePartyRegistered();
                     List<CPlayerActor> players = ScenarioManager.Scenario?.PlayerActors;
@@ -182,7 +225,7 @@ namespace GloomhavenPartyAI
                     {
                         if (IsAutomated(actor))
                         {
-                            Schedule(message, actor, SelectRoundCards(actor));
+                            Schedule(actor, SelectRoundCards(actor));
                         }
                     }
                     break;
@@ -190,14 +233,15 @@ namespace GloomhavenPartyAI
                     if (IsAutomated(message.m_ActorSpawningMessage))
                     {
                         CPlayerActor actor = (CPlayerActor)message.m_ActorSpawningMessage;
-                        Schedule(message, actor, SelectAction(actor));
+                        Schedule(actor, actor.CharacterClass.HasLongRested && !actor.CharacterClass.LongRest && !actor.IsTakingExtraTurn
+                            ? FinishLongRest(actor) : SelectAction(actor));
                     }
                     break;
                 case CMessageData.MessageType.PlayerLongRested:
                     if (IsAutomated(message.m_ActorSpawningMessage))
                     {
                         CPlayerActor actor = (CPlayerActor)message.m_ActorSpawningMessage;
-                        Schedule(message, actor, FinishLongRest(actor));
+                        Schedule(actor, FinishLongRest(actor));
                     }
                     break;
                 case CMessageData.MessageType.ActorIsSelectingMoveTile:
@@ -210,9 +254,17 @@ namespace GloomhavenPartyAI
                     HandleTargetingMessage(message as CActorIsSelectingTargetingFocus_MessageData);
                     break;
                 case CMessageData.MessageType.PlayerSelectingToAvoidDamageOrNot:
-                    HandleDamageMessage(message as CPlayerSelectingToAvoidDamageOrNot_MessageData);
                     break;
             }
+        }
+
+        internal static bool IsScenarioReady()
+        {
+            return !ScenarioRuleClient.ScenarioRuleClientStopped &&
+                PhaseManager.CurrentPhase != null && Choreographer.s_Choreographer != null &&
+                !Choreographer.s_Choreographer.IsRestarting &&
+                SceneController.Instance?.GlobalErrorMessage?.ShowingMessage != true &&
+                !FFSNetwork.IsStartingUp && !FFSNetwork.IsShuttingDown;
         }
 
         private static bool CanAutomate()
@@ -293,23 +345,170 @@ namespace GloomhavenPartyAI
                 string.Equals(actor.CharacterClass.ID, value, StringComparison.OrdinalIgnoreCase);
         }
 
-        private static void Schedule(object token, CPlayerActor actor, IEnumerator routine,
+        private static void Schedule(CPlayerActor actor, IEnumerator routine,
             bool waitForQueue = true)
         {
+            if (!IsScenarioReady() || !IsAutomated(actor)) return;
             DecisionKey key;
             int generation;
             int actorEpoch;
+            PromptStamp prompt;
             lock (StateLock)
             {
                 actorEpoch = GetActorEpochByState(actor.ActorGuid);
-                key = new DecisionKey(token, actor.ActorGuid, actorEpoch);
-                if (!PendingDecisions.Add(key))
+                key = new DecisionKey(!waitForQueue, actor.ActorGuid, actorEpoch);
+                // Epoch changes cancel future AI steps, not the game's already queued command.
+                if (PendingDecisions.Any(p => p.ActorGuid == actor.ActorGuid && p.Damage == key.Damage) ||
+                    IsSettled(actor, key.Damage))
                 {
                     return;
                 }
+                prompt = GetPrompt(actor, key.Damage);
+                if (prompt == null) return;
+                PendingDecisions.Add(key);
                 generation = _generation;
             }
-            _plugin.StartCoroutine(RunScheduled(key, generation, actorEpoch, actor, routine, waitForQueue));
+            try
+            {
+                _plugin.StartCoroutine(RunScheduled(key, generation, actorEpoch, actor, prompt, routine, waitForQueue));
+            }
+            catch (Exception exception)
+            {
+                RemovePending(key);
+                Plugin.Log.LogError("Party AI scheduling failed: " + exception);
+                Record("failure", actor, "reason=exception");
+                Handoff(actor, "exception", key.Damage);
+            }
+        }
+
+        private static string Channel(CActor actor, bool damage) => actor.ActorGuid + (damage ? ":damage" : ":exclusive");
+
+        private static PromptStamp GetPrompt(CPlayerActor actor, bool damage)
+        {
+            if (actor == null || actor.IsDead) return null;
+            if (damage)
+            {
+                if (!DamagePrompts.TryGetValue(actor.ActorGuid, out CPlayerSelectingToAvoidDamageOrNot_MessageData message) ||
+                    !GameState.WaitingForPlayerToSelectDamageResponse ||
+                    !DamageOperations.TryGetValue(actor.ActorGuid, out object operation) ||
+                    !ReferenceEquals(operation, GameState.CurrentDamageData) ||
+                    GameState.CurrentDamageData?.ActorDamaged != message.m_ActorBeingAttacked) return null;
+                // Duplicate notifications share the damage operation, not necessarily the message instance.
+                return new PromptStamp { Token = GameState.CurrentDamageData, State = "damage" };
+            }
+            CCharacterClass cards = actor.CharacterClass;
+            if (PhaseManager.PhaseType == CPhase.PhaseType.SelectAbilityCardsOrLongRest)
+            {
+                return new PromptStamp { Token = PhaseManager.CurrentPhase, State = "cards:" + cards.LongRest + ":" +
+                    string.Join(",", cards.RoundAbilityCards.Select(c => c.CardInstanceID.ToString()).ToArray()) + ":" +
+                    cards.HandAbilityCards.Count + ":" + cards.DiscardedAbilityCards.Count };
+            }
+            if (GameState.InternalCurrentActor != actor) return null;
+            if (PhaseManager.PhaseType == CPhase.PhaseType.ActionSelection)
+            {
+                return new PromptStamp { Token = PhaseManager.CurrentPhase, State = "action:" +
+                    GameState.CurrentActionSelectionSequence + ":" + cards.LongRest + ":" + cards.HasLongRested + ":" +
+                    GameState.PendingOnLongRestBonuses.Count + ":" + cards.RoundAbilityCards.Count + ":" +
+                    GameState.WaitingForMercenarySpecialMechanicSlotChoice + ":" + actor.IsTakingExtraTurn + ":" +
+                    CardsHandManager.Instance?.IsFullCardPreviewShowing + ":" +
+                    CardsHandManager.Instance?.cardsActionController?.IsActionAvailable };
+            }
+            CAbility ability = (PhaseManager.Phase as CPhaseAction)?.CurrentPhaseAbility?.m_Ability;
+            if (ability is CAbilityMerged merged) ability = merged.ActiveAbility;
+            string state;
+            if (ability is CAbilityMove move && move.State == CAbilityMove.EMoveState.ActorIsSelectingMoveTile)
+                state = "move:" + actor.ArrayIndex + ":" + move.RemainingMoves;
+            else if (ability is CAbilityAttack attack && (attack.State == CAbilityAttack.EAttackState.SelectAttackFocus ||
+                attack.State == CAbilityAttack.EAttackState.SelectAttackFocusAdditionalTargets))
+                state = "attack:" + attack.State + ":" + attack.IsWaitingForSingleTargetItemOrActiveBonus() + ":" +
+                    string.Join(",", attack.ActorsToTarget.Select(a => a.ActorGuid).ToArray());
+            else if (ability is CAbilityHeal heal && heal.CanReceiveTileSelection())
+                state = "heal:" + heal.IsWaitingForSingleTargetItemOrActiveBonus() + ":" +
+                    string.Join(",", heal.ActorsToTarget.Select(a => a.ActorGuid).ToArray());
+            else if (ability != null && ability.CanReceiveTileSelection()) state = "unsupported";
+            else return null;
+            return new PromptStamp { Token = ability, State = state };
+        }
+
+        private static bool IsSettled(CPlayerActor actor, bool damage)
+        {
+            string channel = Channel(actor, damage);
+            if (!SettledPrompts.TryGetValue(channel, out PromptStamp settled)) return false;
+            if (settled.Matches(GetPrompt(actor, damage))) return true;
+            SettledPrompts.Remove(channel);
+            return false;
+        }
+
+        internal static bool NeedsInput(CActor actor)
+        {
+            if (!(actor is CPlayerActor player) || !IsAutomated(actor)) return false;
+            lock (StateLock)
+            {
+                return (IsSettled(player, false) && SettledPrompts[Channel(actor, false)].NeedsInput) ||
+                    (IsSettled(player, true) && SettledPrompts[Channel(actor, true)].NeedsInput);
+            }
+        }
+
+        private static void ClearPromptState(CActor actor)
+        {
+            SettledPrompts.Remove(Channel(actor, false));
+            SettledPrompts.Remove(Channel(actor, true));
+            ItemAttempts.Remove(actor.ActorGuid);
+        }
+
+        // Main's manual-input patches can call this for actions that do not change prompt identity.
+        internal static void NotifyManualAction(CActor actor)
+        {
+            if (actor == null) return;
+            lock (StateLock)
+            {
+                ClearPromptState(actor);
+                ActorEpochs[actor.ActorGuid] = GetActorEpochByState(actor.ActorGuid) + 1;
+            }
+            TacticalPlanner.InvalidatePlan(actor);
+        }
+
+        private static void Handoff(CPlayerActor actor, string reason, bool damage = false)
+        {
+            lock (StateLock)
+            {
+                if (IsSettled(actor, damage)) return;
+                PromptStamp prompt = GetPrompt(actor, damage);
+                if (prompt == null) return;
+                prompt.NeedsInput = true;
+                SettledPrompts[Channel(actor, damage)] = prompt;
+            }
+            Record("handoff", actor, "reason=" + reason);
+            Plugin.Log.LogWarning(Describe(actor) + " AI WAIT: " + reason + "; manual input or a new prompt is required.");
+        }
+
+        // Main-thread polling at about 0.5 seconds; never manufactures a prompt or drains commands.
+        internal static void Reconcile()
+        {
+            if (!CanAutomate() || !IsScenarioReady()) return;
+            foreach (CPlayerActor actor in ScenarioManager.Scenario?.PlayerActors.ToList() ?? new List<CPlayerActor>())
+            {
+                try
+                {
+                    lock (StateLock)
+                    {
+                        IsSettled(actor, false);
+                        IsSettled(actor, true);
+                        if (GetPrompt(actor, true) == null)
+                        {
+                            DamagePrompts.Remove(actor.ActorGuid);
+                            DamageOperations.Remove(actor.ActorGuid);
+                        }
+                    }
+                    if (IsAutomated(actor)) ResumeAutomation(actor);
+                }
+                catch (Exception exception)
+                {
+                    Plugin.Log.LogError("Party AI reconciliation failed: " + exception);
+                    Record("failure", actor, "reason=exception");
+                    Handoff(actor, "exception");
+                }
+            }
         }
 
         private static void ResumeAutomation(CPlayerActor actor)
@@ -323,25 +522,36 @@ namespace GloomhavenPartyAI
                 GameState.WaitingForPlayerToSelectDamageResponse && GameState.CurrentDamageData?.ActorDamaged ==
                 damageMessage.m_ActorBeingAttacked)
             {
-                Schedule(damageMessage, actor, ResolveDamage(damageMessage), waitForQueue: false);
+                Schedule(actor, ResolveDamage(damageMessage), waitForQueue: false);
                 return;
             }
+            if (GameState.WaitingForPlayerToSelectDamageResponse) return;
+            lock (StateLock)
+            {
+                if (PendingDecisions.Any(p => p.ActorGuid == actor.ActorGuid && !p.Damage)) return;
+            }
+            if (ScenarioRuleClient.IsProcessingOrMessagesQueued) return;
 
             if (PhaseManager.PhaseType == CPhase.PhaseType.SelectAbilityCardsOrLongRest)
             {
-                Schedule(PhaseManager.CurrentPhase, actor, SelectRoundCards(actor));
+                Schedule(actor, SelectRoundCards(actor));
                 return;
             }
 
             if (PhaseManager.PhaseType == CPhase.PhaseType.ActionSelection && GameState.InternalCurrentActor == actor)
             {
-                if (actor.CharacterClass.HasLongRested && !actor.CharacterClass.LongRest)
+                if (GameState.WaitingForMercenarySpecialMechanicSlotChoice)
                 {
-                    Schedule(PhaseManager.CurrentPhase, actor, FinishLongRest(actor));
+                    Handoff(actor, "unsupported");
+                    return;
+                }
+                if (actor.CharacterClass.HasLongRested && !actor.CharacterClass.LongRest && !actor.IsTakingExtraTurn)
+                {
+                    Schedule(actor, FinishLongRest(actor));
                 }
                 else
                 {
-                    Schedule(PhaseManager.CurrentPhase, actor, SelectAction(actor));
+                    Schedule(actor, SelectAction(actor));
                 }
                 return;
             }
@@ -358,75 +568,116 @@ namespace GloomhavenPartyAI
                 if (ability is CAbilityMove move && TacticalPlanner.IsSupportedMove(move) &&
                     move.State == CAbilityMove.EMoveState.ActorIsSelectingMoveTile)
                 {
-                    Schedule(move, actor, ContinueMove(actor, move));
+                    Schedule(actor, ContinueMove(actor, move));
                     return;
                 }
                 if (ability is CAbilityAttack attack && TacticalPlanner.IsSupportedAttack(attack) &&
                     (attack.State == CAbilityAttack.EAttackState.SelectAttackFocus ||
                      attack.State == CAbilityAttack.EAttackState.SelectAttackFocusAdditionalTargets))
                 {
-                    Schedule(attack, actor, ContinueAttack(actor, attack));
+                    Schedule(actor, ContinueAttack(actor, attack));
                     return;
                 }
-                if (ability is CAbilityHeal heal && TacticalPlanner.IsSupportedHeal(heal) &&
+                if (ability is CAbilityHeal heal &&
                     heal.CanReceiveTileSelection())
                 {
-                    Schedule(heal, actor, ContinueHeal(actor, heal));
+                    Schedule(actor, ContinueHeal(actor, heal));
                     return;
                 }
+                if (GetPrompt(actor, false) != null) Handoff(actor, "unsupported");
             }
         }
 
         private static IEnumerator RunScheduled(DecisionKey key, int generation, int actorEpoch,
-            CPlayerActor actor, IEnumerator routine, bool waitForQueue)
+            CPlayerActor actor, PromptStamp initial, IEnumerator routine, bool waitForQueue)
         {
-            yield return new WaitForSecondsRealtime(Math.Max(0f, Plugin.DecisionDelay.Value));
-            if (!DecisionIsCurrent(key, generation, actorEpoch, actor))
+            try
             {
-                RemovePending(key);
-                yield break;
-            }
-
-            while (waitForQueue && ScenarioRuleClient.IsProcessingOrMessagesQueued)
-            {
-                yield return null;
-                if (!DecisionIsCurrent(key, generation, actorEpoch, actor))
+                yield return new WaitForSecondsRealtime(Math.Min(5f, Math.Max(0f, Plugin.DecisionDelay.Value)));
+                float deadline = Time.realtimeSinceStartup + WaitTimeoutSeconds;
+                bool finished = false;
+                bool started = false;
+                Record("decision", actor, key.Damage ? "action=damage" : "reason=best_score");
+                while (DecisionIsCurrent(key, generation, actorEpoch, actor))
                 {
-                    RemovePending(key);
-                    yield break;
-                }
-            }
-
-            while (true)
-            {
-                if (!DecisionIsCurrent(key, generation, actorEpoch, actor))
-                {
-                    break;
-                }
-
-                bool hasNext;
-                object current = null;
-                try
-                {
-                    hasNext = routine.MoveNext();
-                    if (hasNext)
+                    if (Time.realtimeSinceStartup >= deadline)
                     {
-                        current = routine.Current;
+                        // Stop only our iterator. Never undo/cancel a command already in the rule queue,
+                        // and retain committed attack authorization until the game's Perform consumes it.
+                        // A completed command may already have opened the next prompt. Never
+                        // mark that successor as failed on behalf of this older worker.
+                        if (initial.Matches(GetPrompt(actor, key.Damage)))
+                        {
+                            Record("failure", actor, "reason=timeout");
+                            Handoff(actor, "timeout", key.Damage);
+                        }
+                        yield break;
+                    }
+                    if (waitForQueue && (ScenarioRuleClient.IsProcessingOrMessagesQueued ||
+                        GameState.WaitingForPlayerToSelectDamageResponse))
+                    {
+                        yield return null;
+                        continue;
+                    }
+                    if (finished)
+                    {
+                        bool itemSubmitted = !key.Damage && ItemSubmitted.Remove(actor.ActorGuid);
+                        PromptStamp current = GetPrompt(actor, key.Damage);
+                        if (!itemSubmitted && current != null && !IsSettled(actor, key.Damage))
+                        {
+                            if (current.Matches(initial)) Handoff(actor, "invalid_state", key.Damage);
+                        }
+                        yield break;
+                    }
+                    bool hasNext;
+                    object next = null;
+                    try
+                    {
+                        if (!started && !initial.Matches(GetPrompt(actor, key.Damage))) yield break;
+                        started = true;
+                        hasNext = routine.MoveNext();
+                        if (hasNext) next = routine.Current;
+                    }
+                    catch (Exception exception)
+                    {
+                        Plugin.Log.LogError("Party AI decision failed: " + exception);
+                        Record("failure", actor, "reason=exception");
+                        Handoff(actor, "exception", key.Damage);
+                        yield break;
+                    }
+                    finished = !hasNext;
+                    // All decision iterators yield frames, so the deadline is checked even during UI/message waits.
+                    yield return next;
+                }
+            }
+            finally
+            {
+                (routine as IDisposable)?.Dispose();
+                lock (StateLock)
+                {
+                    if (generation == _generation)
+                    {
+                        if (!key.Damage) ItemSubmitted.Remove(actor.ActorGuid);
+                        RemovePending(key);
                     }
                 }
-                catch (Exception exception)
-                {
-                    Plugin.Log.LogError("Party AI decision failed: " + exception);
-                    break;
-                }
-
-                if (!hasNext)
-                {
-                    break;
-                }
-                yield return current;
             }
-            RemovePending(key);
+        }
+
+        private static bool TryItem(CPlayerActor actor, Func<bool> submit)
+        {
+            if (Plugin.AutomateItems == null || !Plugin.AutomateItems.Value || !IsAutomated(actor)) return false;
+            PromptStamp prompt = GetPrompt(actor, false);
+            if (prompt == null || ItemAttempts.TryGetValue(actor.ActorGuid, out PromptStamp attempted) &&
+                attempted.Matches(prompt)) return false;
+            if (!submit()) return false;
+            ItemAttempts[actor.ActorGuid] = prompt;
+            ItemSubmitted.Add(actor.ActorGuid);
+            // An override changes the active ability, not the committed card halves. Keep the
+            // cross-card followup so boots do not erase the attack they were used to enable.
+            if (PhaseManager.PhaseType == CPhase.PhaseType.ActionSelection)
+                TacticalPlanner.InvalidatePlan(actor);
+            return true;
         }
 
         private static bool DecisionIsCurrent(DecisionKey key, int generation, int actorEpoch, CPlayerActor actor)
@@ -439,7 +690,7 @@ namespace GloomhavenPartyAI
                     return false;
                 }
             }
-            return IsAutomated(actor);
+            return IsScenarioReady() && (!key.Damage || Plugin.AutomateDamage.Value) && IsAutomated(actor);
         }
 
         private static void RemovePending(DecisionKey key)
@@ -464,33 +715,55 @@ namespace GloomhavenPartyAI
             }
 
             CCharacterClass character = actor.CharacterClass;
-            if (character.RoundAbilityCards.Count >= 2 || character.LongRest)
+            float uiDeadline = Time.realtimeSinceStartup + UiTimeoutSeconds;
+            while (InitiativeTrack.Instance == null || CardsHandManager.Instance?.CurrentHand == null)
             {
+                if (Time.realtimeSinceStartup >= uiDeadline)
+                {
+                    Handoff(actor, "timeout");
+                    yield break;
+                }
+                yield return null;
+                if (PhaseManager.PhaseType != CPhase.PhaseType.SelectAbilityCardsOrLongRest) yield break;
+            }
+            if (character.LongRest)
+            {
+                RefreshCardSelectionReady(actor);
                 yield break;
             }
 
-            int cardsNeeded = 2 - character.RoundAbilityCards.Count;
+            int cardsNeeded = Math.Max(0, 2 - character.RoundAbilityCards.Count);
             if (character.HandAbilityCards.Count < cardsNeeded)
             {
+                // A half-selected pair must go back to hand before the game can offer a rest.
+                foreach (CAbilityCard card in character.RoundAbilityCards.ToList())
+                {
+                    uint returned = ScenarioRuleClient.MoveAbilityCard(character, card, character.RoundAbilityCards,
+                        character.HandAbilityCards, "RoundAbilityCards", "HandAbilityCards", networkAction: false);
+                    while (returned > ScenarioRuleClient.s_SRLLastProcessedMessageID) yield return null;
+                    if (PhaseManager.PhaseType != CPhase.PhaseType.SelectAbilityCardsOrLongRest) yield break;
+                }
+                character.SetInitiativeAbilityCard(null);
+                character.SetSubInitiativeAbilityCard(null);
                 if (character.RoundAbilityCards.Count == 0 && character.DiscardedAbilityCards.Count >= 2)
                 {
                     character.LongRest = true;
                     actor.IsLongRestSelected = true;
                     Decision(Describe(actor) + " selected a long rest.");
+                    Record("rest", actor, "action=rest;reason=no_cards");
                 }
                 else
                 {
-                    Plugin.Log.LogWarning(Describe(actor) + " cannot select two cards or long rest; leaving the game to resolve exhaustion.");
+                    Handoff(actor, "no_cards");
                 }
-                RefreshCardSelectionReady();
+                RefreshCardSelectionReady(actor);
                 yield break;
             }
 
-            List<CAbilityCard> cards = TacticalPlanner.ChooseRoundCards(actor, cardsNeeded);
+            List<CAbilityCard> cards = cardsNeeded == 0 ? new List<CAbilityCard>() : TacticalPlanner.ChooseRoundCards(actor, cardsNeeded);
             if (cards.Count != cardsNeeded)
             {
-                Plugin.Log.LogWarning(Describe(actor) +
-                    " tactical planner could not select a complete card pair; leaving card selection manual.");
+                Handoff(actor, "no_cards");
                 yield break;
             }
 
@@ -513,9 +786,10 @@ namespace GloomhavenPartyAI
                     yield return null;
                 }
             }
-            if (character.RoundAbilityCards.Count != 2)
+            if (PhaseManager.PhaseType != CPhase.PhaseType.SelectAbilityCardsOrLongRest) yield break;
+            if (character.RoundAbilityCards.Count < 2)
             {
-                Plugin.Log.LogWarning(Describe(actor) + " does not have exactly two selected cards; leaving card selection manual.");
+                Handoff(actor, "no_cards");
                 yield break;
             }
             List<CAbilityCard> roundCards = character.RoundAbilityCards.ToList();
@@ -526,15 +800,19 @@ namespace GloomhavenPartyAI
             actor.IsLongRestSelected = false;
             Decision(Describe(actor) + " selected " + CardName(initiativeCard) +
                 " (initiative) and " + CardName(subInitiativeCard) + " using tactical card scoring.");
+            Record("card_selection", actor, "action=cards;cards=" + roundCards.Count + ";initiative=" + initiativeCard.Initiative);
 
-            RefreshCardSelectionReady();
+            RefreshCardSelectionReady(actor);
         }
 
-        private static void RefreshCardSelectionReady()
+        private static void RefreshCardSelectionReady(CPlayerActor actor)
         {
             if (InitiativeTrack.Instance != null && CardsHandManager.Instance?.CurrentHand != null)
             {
                 InitiativeTrack.Instance.CheckRoundAbilityCardsOrLongRestSelected();
+                PromptStamp prompt = GetPrompt(actor, false);
+                if (prompt != null && (actor.CharacterClass.LongRest || actor.CharacterClass.RoundAbilityCards.Count >= 2))
+                    SettledPrompts[Channel(actor, false)] = prompt;
             }
         }
 
@@ -544,27 +822,47 @@ namespace GloomhavenPartyAI
             {
                 yield break;
             }
+            if (GameState.WaitingForMercenarySpecialMechanicSlotChoice)
+            {
+                Handoff(actor, "unsupported");
+                yield break;
+            }
 
             CCharacterClass character = actor.CharacterClass;
+            float readyDeadline = Time.realtimeSinceStartup + UiTimeoutSeconds;
+            while (Choreographer.s_Choreographer?.readyButton == null)
+            {
+                if (Time.realtimeSinceStartup >= readyDeadline)
+                {
+                    Handoff(actor, "timeout");
+                    yield break;
+                }
+                yield return null;
+                if (GameState.InternalCurrentActor != actor || PhaseManager.PhaseType != CPhase.PhaseType.ActionSelection) yield break;
+            }
             if (character.LongRest && !character.HasLongRested)
             {
                 CAbilityCard lost = TacticalPlanner.ChooseCardToLose(actor, character.DiscardedAbilityCards);
                 if (lost == null)
                 {
-                    Plugin.Log.LogWarning(Describe(actor) + " has no card to lose for its long rest; leaving the choice manual.");
+                    Handoff(actor, "no_cards");
                     yield break;
                 }
                 Decision(Describe(actor) + " long rests and loses " + CardName(lost) + ".");
                 Choreographer.s_Choreographer.readyButton.ClearAlternativeAction();
                 GameState.PlayerLongRested(lost, actor);
+                Record("rest", actor, "action=rest;cards=1");
                 yield break;
             }
+
+            if (TryItem(actor, () => ItemPlanner.TryUseDuringActionSelection(actor))) yield break;
 
             if (GameState.CurrentActionSelectionSequence == GameState.ActionSelectionSequenceType.Complete)
             {
                 Decision(Describe(actor) + " ends its turn.");
                 Choreographer.s_Choreographer.readyButton.ClearAlternativeAction();
                 Choreographer.s_Choreographer.Pass();
+                Record("action_selection", actor, "action=skip");
                 yield break;
             }
 
@@ -573,55 +871,57 @@ namespace GloomhavenPartyAI
                 : character.RoundAbilityCards;
             if (pile.Count == 0)
             {
-                Plugin.Log.LogWarning(Describe(actor) + " has no round card available; leaving action selection manual.");
+                Handoff(actor, "no_cards");
                 yield break;
             }
 
             TacticalPlanner.PlannedAction planned = TacticalPlanner.ChooseNextAction(actor);
             if (planned == null || !pile.Contains(planned.Card))
             {
-                Plugin.Log.LogWarning(Describe(actor) +
-                    " has no safe tactical card action; leaving action selection manual.");
+                Handoff(actor, "no_action");
                 yield break;
             }
             CAbilityCard card = planned.Card;
             CBaseCard.ActionType action = planned.ActionType;
-            while (CardsHandManager.Instance != null && CardsHandManager.Instance.IsFullCardPreviewShowing)
+            PromptStamp prompt = GetPrompt(actor, false);
+            FullAbilityCard cardUi;
+            float cardDeadline = Time.realtimeSinceStartup + UiTimeoutSeconds;
+            while (true)
             {
+                if (!prompt.Matches(GetPrompt(actor, false))) yield break;
+                CardsActionControlller actionController = CardsHandManager.Instance?.cardsActionController;
+                FullAbilityCard topCard = actionController == null ? null : ActionTopCard.GetValue(actionController) as FullAbilityCard;
+                FullAbilityCard bottomCard = actionController == null ? null : ActionBottomCard.GetValue(actionController) as FullAbilityCard;
+                cardUi = topCard != null && topCard.AbilityCard == card ? topCard : bottomCard;
+                if (cardUi != null && cardUi.AbilityCard == card && actionController.IsActionAvailable &&
+                    !CardsHandManager.Instance.IsFullCardPreviewShowing && cardUi.IsInteractable(action)) break;
+                if (Time.realtimeSinceStartup >= cardDeadline)
+                {
+                    Handoff(actor, "timeout");
+                    yield break;
+                }
                 yield return null;
             }
-            if (GameState.InternalCurrentActor != actor ||
-                PhaseManager.PhaseType != CPhase.PhaseType.ActionSelection)
-            {
-                yield break;
-            }
-            CardsActionControlller actionController = CardsHandManager.Instance?.cardsActionController;
-            FullAbilityCard topCard = actionController == null
-                ? null
-                : ActionTopCard.GetValue(actionController) as FullAbilityCard;
-            FullAbilityCard bottomCard = actionController == null
-                ? null
-                : ActionBottomCard.GetValue(actionController) as FullAbilityCard;
-            FullAbilityCard cardUi = topCard != null && topCard.AbilityCard == card ? topCard : bottomCard;
-            if (cardUi == null || cardUi.AbilityCard != card || !actionController.IsActionAvailable)
-            {
-                Plugin.Log.LogWarning(Describe(actor) +
-                    " card UI is not ready; leaving action selection manual.");
-                yield break;
-            }
-            if (!cardUi.IsInteractable(action))
-            {
-                Plugin.Log.LogWarning(Describe(actor) + " planned " + TacticalPlanner.Describe(planned) +
-                    " is not currently interactable; leaving action selection manual.");
-                yield break;
-            }
+            if (TryItem(actor, () => ItemPlanner.TryUseDuringActionSelection(actor))) yield break;
             Decision(Describe(actor) + " uses " + CardName(card) + " " + TacticalPlanner.Describe(planned) + ".");
             cardUi.OnAbilityClick(action, isProxyAction: false, checkValid: true);
+            Record("action_selection", actor, "reason=best_score;card_id=" + card.ID);
         }
 
         private static IEnumerator FinishLongRest(CPlayerActor actor)
         {
             yield return null;
+            if (!actor.CharacterClass.HasLongRested || actor.CharacterClass.LongRest || actor.IsTakingExtraTurn) yield break;
+            float deadline = Time.realtimeSinceStartup + UiTimeoutSeconds;
+            while (Choreographer.s_Choreographer?.readyButton == null)
+            {
+                if (Time.realtimeSinceStartup >= deadline)
+                {
+                    Handoff(actor, "timeout");
+                    yield break;
+                }
+                yield return null;
+            }
             if (GameState.InternalCurrentActor != actor || PhaseManager.PhaseType != CPhase.PhaseType.ActionSelection)
             {
                 yield break;
@@ -629,12 +929,14 @@ namespace GloomhavenPartyAI
 
             if (GameState.PendingOnLongRestBonuses.Count == 0)
             {
+                if (TryItem(actor, () => ItemPlanner.TryUseDuringActionSelection(actor))) yield break;
                 Choreographer.s_Choreographer.readyButton.ClearAlternativeAction();
                 Choreographer.s_Choreographer.Pass();
+                Record("rest", actor, "action=rest");
             }
             else
             {
-                Plugin.Log.LogWarning(Describe(actor) + " has an unsupported long-rest bonus choice; leaving it manual.");
+                Handoff(actor, "unsupported");
             }
         }
 
@@ -642,10 +944,12 @@ namespace GloomhavenPartyAI
         {
             CPlayerActor actor = message?.m_ActorSpawningMessage as CPlayerActor;
             CAbilityMove move = message?.m_MoveAbility;
+            if (move == null || !IsCurrentAbility(move)) return;
             if (actor != null && TacticalPlanner.IsSupportedMove(move) && IsAutomated(actor))
             {
-                Schedule(message, actor, ContinueMove(actor, move));
+                Schedule(actor, ContinueMove(actor, move));
             }
+            else if (IsAutomated(actor)) Handoff(actor, "unsupported");
         }
 
         private static IEnumerator ContinueMove(CPlayerActor actor, CAbilityMove move)
@@ -653,16 +957,26 @@ namespace GloomhavenPartyAI
             if (GameState.InternalCurrentActor == actor && TacticalPlanner.IsSupportedMove(move) &&
                 move.State == CAbilityMove.EMoveState.ActorIsSelectingMoveTile && IsCurrentAbility(move))
             {
+                if (Plugin.AutomateItems.Value)
+                {
+                    int bonus = ItemPlanner.AvailableMoveBonus(actor, move);
+                    int pathCost = bonus > 0 ? TacticalPlanner.UsefulBootsPathCost(actor, move, bonus) : 0;
+                    if (pathCost > 0 && TryItem(actor, () => ItemPlanner.TryUseForMove(actor, move, pathCost)))
+                        yield break;
+                }
                 CTile destination = TacticalPlanner.ChooseMoveDestination(actor, move);
                 if (destination == null || destination.m_ArrayIndex == actor.ArrayIndex)
                 {
                     Decision(Describe(actor) + " has no useful move and skips movement.");
                     ScenarioRuleClient.Pass();
+                    Record("action_selection", actor, "action=skip;reason=no_path");
                 }
                 else
                 {
                     Decision(Describe(actor) + " moves to " + destination.m_ArrayIndex + ".");
-                    ScenarioRuleClient.TileSelected(destination, new List<CTile> { destination });
+                    if (ScenarioRuleClient.TileSelected(destination, new List<CTile> { destination }) != 0)
+                        Record("move_submitted", actor, "action=move;x=" + destination.m_ArrayIndex.X + ";y=" + destination.m_ArrayIndex.Y);
+                    else Handoff(actor, "invalid_state");
                 }
             }
             yield break;
@@ -672,36 +986,50 @@ namespace GloomhavenPartyAI
         {
             CPlayerActor actor = message?.m_AttackingActor as CPlayerActor;
             CAbilityAttack attack = message?.m_AttackAbility;
+            if (attack == null || !IsCurrentAbility(attack)) return;
             if (actor != null && TacticalPlanner.IsSupportedAttack(attack) && IsAutomated(actor) &&
                 (attack.State == CAbilityAttack.EAttackState.SelectAttackFocus ||
                  attack.State == CAbilityAttack.EAttackState.SelectAttackFocusAdditionalTargets))
             {
                 if (attack.IsWaitingForSingleTargetItemOrActiveBonus())
                 {
-                    Plugin.Log.LogWarning(Describe(actor) +
-                        " has a mandatory single-target attack choice; leaving target selection manual.");
+                    Handoff(actor, "unsupported");
                     return;
                 }
-                Schedule(message, actor, ContinueAttack(actor, attack));
+                Schedule(actor, ContinueAttack(actor, attack));
             }
+            else if (IsAutomated(actor)) Handoff(actor, "unsupported");
         }
 
         private static IEnumerator ContinueAttack(CPlayerActor actor, CAbilityAttack attack)
         {
             if (GameState.InternalCurrentActor != actor || !TacticalPlanner.IsSupportedAttack(attack) ||
-                !IsCurrentAbility(attack) ||
-                attack.IsWaitingForSingleTargetItemOrActiveBonus())
+                !IsCurrentAbility(attack))
             {
+                yield break;
+            }
+            if (attack.IsWaitingForSingleTargetItemOrActiveBonus())
+            {
+                Handoff(actor, "unsupported");
                 yield break;
             }
             if (attack.State == CAbilityAttack.EAttackState.SelectAttackFocusAdditionalTargets)
             {
                 Decision(Describe(actor) + " declines optional additional attack targets.");
                 ScenarioRuleClient.StepComplete();
+                Record("action_selection", actor, "action=skip");
                 yield break;
             }
             if (attack.State == CAbilityAttack.EAttackState.SelectAttackFocus)
             {
+                CActor intendedTarget = attack.ActorsToTarget.FirstOrDefault(target =>
+                    target != null && !target.IsDead && attack.ValidActorsInRange.Contains(target)) ??
+                    attack.ValidActorsInRange.Where(target => target != null && !target.IsDead)
+                        .OrderByDescending(target => TacticalPlanner.ScoreAttackTarget(actor, target, attack))
+                        .ThenBy(target => actor.AIMoveFocusActors.IndexOf(target) < 0 ? int.MaxValue : actor.AIMoveFocusActors.IndexOf(target))
+                        .ThenBy(target => SharedAbilityTargeting.GetDistanceBetweenActorsInHexes(target, actor))
+                        .ThenBy(target => target.Initiative()).ThenBy(target => target.ID).FirstOrDefault();
+                if (TryItem(actor, () => ItemPlanner.TryUseForAttack(actor, attack, intendedTarget))) yield break;
                 lock (StateLock)
                 {
                     CommittedAttacks.Add(attack);
@@ -709,7 +1037,9 @@ namespace GloomhavenPartyAI
                 if (ScenarioRuleClient.StepComplete() == 0)
                 {
                     ConsumeCommittedAttack(attack);
+                    Handoff(actor, "invalid_state");
                 }
+                else Record("attack_submitted", actor, "action=attack;targets=" + (intendedTarget == null ? "0" : "1"));
             }
             yield break;
         }
@@ -718,19 +1048,30 @@ namespace GloomhavenPartyAI
         {
             CAbilityHeal heal = message?.m_TargetingAbility as CAbilityHeal;
             CPlayerActor actor = message?.m_ActorSpawningMessage as CPlayerActor;
-            if (actor != null && message.m_IsPositive && TacticalPlanner.IsSupportedHeal(heal) &&
+            if (message?.m_TargetingAbility == null || !IsCurrentAbility(message.m_TargetingAbility)) return;
+            if (actor != null && message.m_IsPositive && heal != null &&
                 IsAutomated(actor) && heal.CanReceiveTileSelection())
             {
-                Schedule(message, actor, ContinueHeal(actor, heal));
+                Schedule(actor, ContinueHeal(actor, heal));
             }
+            else if (IsAutomated(actor)) Handoff(actor, "unsupported");
         }
 
         private static IEnumerator ContinueHeal(CPlayerActor actor, CAbilityHeal heal)
         {
-            if (GameState.InternalCurrentActor != actor || !TacticalPlanner.IsSupportedHeal(heal) ||
-                !heal.CanReceiveTileSelection() || !IsCurrentAbility(heal) ||
-                heal.IsWaitingForSingleTargetItemOrActiveBonus())
+            if (GameState.InternalCurrentActor != actor ||
+                !heal.CanReceiveTileSelection() || !IsCurrentAbility(heal))
             {
+                yield break;
+            }
+            if (TryItem(actor, () => ItemPlanner.TryConfirmHealingItem(actor, heal)))
+            {
+                Record("heal_submitted", actor, "action=heal;targets=1");
+                yield break;
+            }
+            if (!TacticalPlanner.IsSupportedHeal(heal) || heal.IsWaitingForSingleTargetItemOrActiveBonus())
+            {
+                Handoff(actor, "unsupported");
                 yield break;
             }
 
@@ -748,8 +1089,19 @@ namespace GloomhavenPartyAI
 
             foreach (CActor target in targets)
             {
+                if (!IsCurrentAbility(heal) || !heal.CanReceiveTileSelection() ||
+                    heal.IsWaitingForSingleTargetItemOrActiveBonus()) yield break;
+                // TileSelected toggles selection. A manual/game-selected target must not be toggled off.
+                if (heal.ActorsToTarget.Contains(target) || target.IsDead ||
+                    !heal.ValidActorsInRange.Contains(target) || TacticalPlanner.ScoreHealTarget(target, heal) <= 0f) continue;
+                if (heal.ActorsToTarget.Count >= heal.NumberTargets) break;
                 uint messageId = ScenarioRuleClient.TileSelected(
                     ScenarioManager.Tiles[target.ArrayIndex.X, target.ArrayIndex.Y], null);
+                if (messageId == 0)
+                {
+                    Handoff(actor, "invalid_state");
+                    yield break;
+                }
                 while (messageId > ScenarioRuleClient.s_SRLLastProcessedMessageID)
                 {
                     yield return null;
@@ -770,17 +1122,19 @@ namespace GloomhavenPartyAI
             {
                 Decision(Describe(actor) + " heals " +
                     string.Join(", ", heal.ActorsToTarget.Select(target => target.Class.ID).ToArray()) + ".");
-                ScenarioRuleClient.StepComplete();
+                if (ScenarioRuleClient.StepComplete() != 0)
+                    Record("heal_submitted", actor, "action=heal;targets=" + heal.ActorsToTarget.Count);
+                else Handoff(actor, "invalid_state");
             }
             else if (usefulSelected == null && heal.CanSkip)
             {
                 Decision(Describe(actor) + " has no useful heal target and skips healing.");
                 ScenarioRuleClient.Pass();
+                Record("action_selection", actor, "action=skip;reason=no_target");
             }
             else
             {
-                Plugin.Log.LogWarning(Describe(actor) +
-                    " has an unresolved mandatory heal choice; leaving target selection manual.");
+                Handoff(actor, "unsupported");
             }
         }
 
@@ -804,37 +1158,66 @@ namespace GloomhavenPartyAI
             }
             lock (StateLock)
             {
-                DamagePrompts[actor.ActorGuid] = message;
+                if (DamageOperations.TryGetValue(actor.ActorGuid, out object operation) &&
+                    ReferenceEquals(operation, GameState.CurrentDamageData) &&
+                    DamagePrompts.TryGetValue(actor.ActorGuid, out CPlayerSelectingToAvoidDamageOrNot_MessageData existing))
+                    message = existing;
+                else
+                {
+                    DamagePrompts[actor.ActorGuid] = message;
+                    DamageOperations[actor.ActorGuid] = GameState.CurrentDamageData;
+                }
             }
 
             if (!Plugin.AutomateDamage.Value || !IsAutomated(actor))
             {
                 return;
             }
-            Schedule(message, actor, ResolveDamage(message), waitForQueue: false);
+            Schedule(actor, ResolveDamage(message), waitForQueue: false);
         }
 
         private static IEnumerator ResolveDamage(CPlayerSelectingToAvoidDamageOrNot_MessageData message)
         {
             yield return null;
             CPlayerActor owner = message.m_ActorToShowCardsFor;
+            float deadline = Time.realtimeSinceStartup + UiTimeoutSeconds;
+            while (!Singleton<TakeDamagePanel>.IsInitialized ||
+                !Singleton<TakeDamagePanel>.Instance.IsTakingDamage(message.m_ActorBeingAttacked))
+            {
+                if (!Plugin.AutomateDamage.Value || !IsCurrentDamagePrompt(owner, message) ||
+                    GetPrompt(owner, true) == null) yield break;
+                if (Time.realtimeSinceStartup >= deadline)
+                {
+                    Handoff(owner, "timeout", true);
+                    yield break;
+                }
+                yield return null;
+            }
             GameState.DamageData damage = GameState.CurrentDamageData;
-            if (!GameState.WaitingForPlayerToSelectDamageResponse || !IsAutomated(owner) ||
+            if (!Plugin.AutomateDamage.Value || !GameState.WaitingForPlayerToSelectDamageResponse || !IsAutomated(owner) ||
                 damage == null || damage.ActorDamaged != message.m_ActorBeingAttacked ||
-                !IsCurrentDamagePrompt(owner, message))
+                !IsCurrentDamagePrompt(owner, message) || GetPrompt(owner, true) == null)
             {
                 yield break;
             }
 
+            // GameState.ActorBeenDamaged calls actor.Damaged before opening this response prompt.
             bool lethal = message.m_ActorBeingAttacked.Health <= 0;
             CCharacterClass character = owner.CharacterClass;
             if (lethal && Plugin.PreventLethalDamage.Value && character.HandAbilityCards.Count > 0)
             {
                 CAbilityCard card = TacticalPlanner.ChooseCardToLose(owner, character.HandAbilityCards);
+                if (card == null)
+                {
+                    Handoff(owner, "no_cards", true);
+                    yield break;
+                }
                 GameState.Lose1HandCardToAvoidAttack(owner, card);
                 GameState.PlayerAvoidingDamage(GameState.EAvoidDamageOption.Lose1HandCard);
+                ClearCompletedDamage(owner, message);
                 Singleton<TakeDamagePanel>.Instance.ResetAndHide(true);
                 Decision(Describe(owner) + " loses " + CardName(card) + " to prevent lethal damage.");
+                Record("damage_response", owner, "action=damage;reason=lethal;cards=1");
                 yield break;
             }
 
@@ -842,18 +1225,42 @@ namespace GloomhavenPartyAI
             {
                 List<CAbilityCard> cards = TacticalPlanner.ChooseCardsToLose(owner,
                     character.DiscardedAbilityCards, 2);
+                if (cards.Count < 2)
+                {
+                    Handoff(owner, "no_cards", true);
+                    yield break;
+                }
                 GameState.Lose2DiscardCardsToAvoidAttack(owner, cards[0], cards[1]);
                 GameState.PlayerAvoidingDamage(GameState.EAvoidDamageOption.Lose2DiscardCards);
+                ClearCompletedDamage(owner, message);
                 Singleton<TakeDamagePanel>.Instance.ResetAndHide(true);
                 Decision(Describe(owner) + " loses two discarded cards to prevent lethal damage.");
+                Record("damage_response", owner, "action=damage;reason=lethal;cards=2");
                 yield break;
             }
 
             Decision(Describe(owner) + " accepts " + message.m_ModifiedStrength + " damage.");
             Singleton<TakeDamagePanel>.Instance.TakeDamage();
+            Record("damage_response", owner, "action=damage;damage=" + message.m_ModifiedStrength +
+                ";reason=" + (lethal ? "lethal" : "nonlethal"));
+            ClearCompletedDamage(owner, message);
             if (GameState.WaitingForPlayerToSelectDamageResponse)
             {
-                Plugin.Log.LogWarning("Damage automation could not satisfy a mandatory item or active-bonus choice; leaving the prompt manual.");
+                Handoff(owner, "unsupported", true);
+            }
+        }
+
+        private static void ClearCompletedDamage(CPlayerActor owner,
+            CPlayerSelectingToAvoidDamageOrNot_MessageData message)
+        {
+            lock (StateLock)
+            {
+                if (IsCurrentDamagePrompt(owner, message) && GetPrompt(owner, true) == null)
+                {
+                    DamagePrompts.Remove(owner.ActorGuid);
+                    DamageOperations.Remove(owner.ActorGuid);
+                    SettledPrompts.Remove(Channel(owner, true));
+                }
             }
         }
 
@@ -874,6 +1281,11 @@ namespace GloomhavenPartyAI
                 return actor.CharacterName + " [" + actor.CharacterClass.CharacterID + "]";
             }
             return actor.CharacterClass.CharacterID;
+        }
+
+        private static void Record(string kind, CActor actor, string detail)
+        {
+            if (!FFSNetwork.IsOnline) DeveloperDiagnostics.Record(kind, actor, detail);
         }
 
         private static string CardName(CAbilityCard card)

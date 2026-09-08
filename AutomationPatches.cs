@@ -11,12 +11,28 @@ namespace GloomhavenPartyAI
     internal static class AutomationPatches
     {
         [HarmonyPatch(typeof(Choreographer), "ProcessMessage")]
+        [HarmonyPrefix]
+        private static void ObserveMessagePrefix(CMessageData message)
+        {
+            // Capture error notifications before the original handler opens its blocking dialog.
+            if (ScenarioRuleClient.s_MainThread == Thread.CurrentThread)
+                DeveloperDiagnostics.ObserveMessage(message);
+        }
+
+        [HarmonyPatch(typeof(Choreographer), nameof(Choreographer.LogScenarioResult))]
+        [HarmonyPrefix]
+        private static void ScenarioResultPrefix(SEventActorFinishedScenario.EScenarioResult result)
+        {
+            if (ScenarioRuleClient.s_MainThread == Thread.CurrentThread)
+                DeveloperDiagnostics.ObserveScenarioResult(result);
+        }
+
+        [HarmonyPatch(typeof(Choreographer), "ProcessMessage")]
         [HarmonyPostfix]
         private static void ProcessMessagePostfix(Choreographer __instance, CMessageData message)
         {
             if (ScenarioRuleClient.s_MainThread != Thread.CurrentThread || message == null ||
-                PhaseManager.CurrentPhase == null || __instance.IsRestarting ||
-                SceneController.Instance?.GlobalErrorMessage?.ShowingMessage == true)
+                !AutomationController.IsScenarioReady())
             {
                 return;
             }
@@ -41,6 +57,7 @@ namespace GloomhavenPartyAI
         [HarmonyPrefix]
         private static void ScenarioStartPrefix()
         {
+            DeveloperDiagnostics.EndSession("scenario_start");
             AutomationController.Reset();
         }
 

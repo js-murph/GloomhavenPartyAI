@@ -2,6 +2,8 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
+using ScenarioRuleLibrary;
+using UnityEngine;
 
 namespace GloomhavenPartyAI
 {
@@ -10,7 +12,7 @@ namespace GloomhavenPartyAI
     {
         public const string Guid = "com.jsm.gloomhaven.partyai";
         public const string Name = "Gloomhaven Party AI";
-        public const string Version = "0.3.2";
+        public const string Version = "0.4.0";
 
         internal static ManualLogSource Log;
         internal static ConfigEntry<bool> ModEnabled;
@@ -19,8 +21,11 @@ namespace GloomhavenPartyAI
         internal static ConfigEntry<bool> PreventLethalDamage;
         internal static ConfigEntry<float> DecisionDelay;
         internal static ConfigEntry<bool> LogDecisions;
+        internal static ConfigEntry<bool> AutomateItems;
+        internal static ConfigEntry<bool> DeveloperMode;
 
         private Harmony _harmony;
+        private float _nextPoll;
 
         private void Awake()
         {
@@ -37,15 +42,35 @@ namespace GloomhavenPartyAI
                 "Small real-time delay before automated UI decisions.");
             LogDecisions = Config.Bind("General", "LogDecisions", true,
                 "Write card, rest, action, targeting, and damage decisions to the BepInEx log.");
+            AutomateItems = Config.Bind("Decisions", "AutomateItems", true,
+                "Evaluate supported healing, movement, and attack items for automated mercenaries. Complex item choices remain manual.");
+            DeveloperMode = Config.Bind("Diagnostics", "DeveloperMode", false,
+                "Write offline diagnostic JSONL files under BepInEx/PartyAI/diagnostics (up to five 5 MiB files). No uploads. Does not enable automation.");
 
             AutomationController.Attach(this);
+            DeveloperDiagnostics.Initialize(DeveloperMode, AutomationController.AutomationState);
             _harmony = new Harmony(Guid);
             _harmony.PatchAll(typeof(AutomationPatches));
             Logger.LogInfo(Name + " v" + Version + " loaded (offline-only tactical mode).");
         }
 
+        private void Update()
+        {
+            if (Time.realtimeSinceStartup < _nextPoll) return;
+            _nextPoll = Time.realtimeSinceStartup + 0.5f;
+            DeveloperDiagnostics.ObserveState();
+            var result = ScenarioManager.Scenario?.CurrentScenarioResult;
+            if (result == SEventActorFinishedScenario.EScenarioResult.Win ||
+                result == SEventActorFinishedScenario.EScenarioResult.Lose ||
+                result == SEventActorFinishedScenario.EScenarioResult.Resign)
+                DeveloperDiagnostics.EndSession("scenario_result");
+            AutomationController.Reconcile();
+            AutomationToggleUi.RefreshAll();
+        }
+
         private void OnDestroy()
         {
+            DeveloperDiagnostics.Shutdown();
             AutomationController.Reset();
             _harmony?.UnpatchSelf();
         }

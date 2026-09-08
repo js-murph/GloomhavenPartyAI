@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using AStar;
 using ScenarioRuleLibrary;
@@ -24,8 +25,10 @@ namespace GloomhavenPartyAI
 
         private sealed class TurnPlan
         {
-            internal CAbilityCard FirstCard;
+            internal PlannedAction First;
             internal PlannedAction Followup;
+            internal float Score;
+            internal float AttackValue;
         }
 
         private static readonly object PlanLock = new object();
@@ -39,10 +42,23 @@ namespace GloomhavenPartyAI
             }
         }
 
+        internal static void InvalidatePlan(CActor actor)
+        {
+            if (actor == null)
+            {
+                return;
+            }
+            lock (PlanLock)
+            {
+                TurnPlans.Remove(actor.ActorGuid);
+            }
+        }
+
         internal static List<CAbilityCard> ChooseRoundCards(CPlayerActor actor, int cardsNeeded)
         {
             List<CAbilityCard> hand = actor.CharacterClass.HandAbilityCards.ToList();
             List<CAbilityCard> selected = actor.CharacterClass.RoundAbilityCards.ToList();
+            var reachable = new Dictionary<Tuple<CPlayerActor, int, int>, List<CTile>>();
             if (cardsNeeded <= 0 || hand.Count < cardsNeeded)
             {
                 return new List<CAbilityCard>();
@@ -51,7 +67,7 @@ namespace GloomhavenPartyAI
             if (selected.Count == 1 && cardsNeeded == 1)
             {
                 CAbilityCard partner = hand
-                    .OrderByDescending(card => ScorePair(actor, selected[0], card))
+                    .OrderByDescending(card => ScorePair(actor, selected[0], card, reachable))
                     .ThenBy(card => card.Initiative)
                     .ThenBy(card => card.ID)
                     .ThenBy(card => card.CardInstanceID)
@@ -68,7 +84,7 @@ namespace GloomhavenPartyAI
                 {
                     CAbilityCard first = hand[firstIndex];
                     CAbilityCard second = hand[secondIndex];
-                    float score = ScorePair(actor, first, second);
+                    float score = ScorePair(actor, first, second, reachable);
                     if (score > bestScore || Math.Abs(score - bestScore) < 0.001f &&
                         ComparePair(first, second, bestFirst, bestSecond) < 0)
                     {
@@ -91,11 +107,18 @@ namespace GloomhavenPartyAI
                 return null;
             }
 
-            int nearestEnemy = NearestEnemyDistance(actor);
-            bool underPressure = nearestEnemy <= 3 || actor.Health * 2 <= actor.MaxHealth;
-            return underPressure
-                ? cards.OrderBy(card => card.Initiative).ThenBy(card => card.ID).First()
-                : cards.OrderByDescending(card => card.Initiative).ThenBy(card => card.ID).First();
+            TurnPlan plan = cards.Count >= 2
+                ? EvaluatePlans(actor, cards[0], cards[1]).OrderByDescending(value => value.Score)
+                    .ThenByDescending(value => value.First.Score).FirstOrDefault()
+                : null;
+            float attackValue = plan?.AttackValue ?? 0f;
+            float healValue = plan == null ? 0f : new[] { plan.First, plan.Followup }
+                .SelectMany(action => action.Action.Abilities.OfType<CAbilityHeal>())
+                .Sum(heal => ScoreHeal(actor, heal));
+            bool underPressure = NearestEnemyDistance(actor) <= 3 || actor.Health * 2 <= actor.MaxHealth;
+            return cards.OrderByDescending(card => TacticalEvaluation.InitiativeValue(card.Initiative,
+                    attackValue, healValue, underPressure))
+                .ThenBy(card => card.ID).ThenBy(card => card.CardInstanceID).First();
         }
 
         internal static PlannedAction ChooseNextAction(CPlayerActor actor)
@@ -106,11 +129,13 @@ namespace GloomhavenPartyAI
                 .ToList();
             if (cards.Count == 0)
             {
+                InvalidatePlan(actor);
                 return null;
             }
 
             if (GameState.CurrentActionSelectionSequence == GameState.ActionSelectionSequenceType.SecondAction)
             {
+                InvalidatePlan(actor);
                 CAbilityCard usedCard = GameState.RoundAbilityCardselected;
                 CAbilityCard remaining = cards.FirstOrDefault(card => card != usedCard);
                 if (remaining == null)
@@ -120,132 +145,229 @@ namespace GloomhavenPartyAI
                 bool needTop = GameState.HasPlayedBottomAction;
                 bool firstActionWasHeal = usedCard?.LastSelectedAction?.Abilities?
                     .OfType<CAbilityHeal>().Any() == true;
-                PlannedAction result = BestHalf(actor, remaining, needTop, firstActionWasHeal);
-                lock (PlanLock)
-                {
-                    TurnPlans.Remove(actor.ActorGuid);
-                }
-                return result;
+                var reachable = new Dictionary<Tuple<CPlayerActor, int, int>, List<CTile>>();
+                return HalfOptions(actor, remaining, needTop)
+                    .Select(option =>
+                    {
+                        if (firstActionWasHeal)
+                        {
+                            PenalizeRoutineHeal(actor, option, null, false);
+                        }
+                        return option;
+                    })
+                    .OrderByDescending(option =>
+                    {
+                        float score = ScoreActionOrder(actor, option, null, reachable, out _);
+                        RecordActionCandidate(actor, option, null, score);
+                        return score;
+                    })
+                    .ThenByDescending(option => option.Action.Abilities.OfType<CAbilityAttack>()
+                        .Sum(attack => attack.Strength))
+                    .FirstOrDefault();
             }
 
             if (cards.Count < 2)
             {
+                InvalidatePlan(actor);
                 return null;
             }
 
-            PlannedAction firstTop = BestHalf(actor, cards[0], top: true);
-            PlannedAction firstBottom = BestHalf(actor, cards[0], top: false);
-            PlannedAction secondTop = BestHalf(actor, cards[1], top: true);
-            PlannedAction secondBottom = BestHalf(actor, cards[1], top: false);
-
-            PlannedAction[][] sequences =
+            TurnPlan plan = EvaluatePlans(actor, cards[0], cards[1], recordCandidates: true)
+                .OrderByDescending(sequence => sequence.Score)
+                .ThenByDescending(sequence => sequence.First.Score)
+                // Equal capped utility should not prefer Attack 2 over a stronger non-loss attack.
+                .ThenByDescending(sequence => sequence.First.Action.Abilities
+                    .Concat(sequence.Followup.Action.Abilities).OfType<CAbilityAttack>().Sum(attack => attack.Strength))
+                .FirstOrDefault();
+            if (plan == null)
             {
-                BuildOrderedSequence(actor, firstTop, secondBottom),
-                BuildOrderedSequence(actor, secondBottom, firstTop),
-                BuildOrderedSequence(actor, secondTop, firstBottom),
-                BuildOrderedSequence(actor, firstBottom, secondTop)
-            };
-            PlannedAction[] bestSequence = sequences
-                .OrderByDescending(sequence => ScoreActionOrder(actor, sequence[0], sequence[1]))
-                .ThenByDescending(sequence => sequence[0].Score)
-                .First();
-            PlannedAction firstAction = bestSequence[0];
-            PlannedAction followup = bestSequence[1];
+                InvalidatePlan(actor);
+                return null;
+            }
 
             lock (PlanLock)
             {
-                TurnPlans[actor.ActorGuid] = new TurnPlan
-                {
-                    FirstCard = firstAction.Card,
-                    Followup = followup
-                };
+                TurnPlans[actor.ActorGuid] = plan;
             }
-            return firstAction;
+            return plan.First;
         }
 
         internal static CAbilityAttack GetFollowupAttack(CActor actor)
         {
-            if (actor == null)
+            return GetFollowupAttacks(actor).FirstOrDefault();
+        }
+
+        internal static List<CAbilityAttack> GetFollowupAttacks(CActor actor)
+        {
+            if (actor == null || GameState.InternalCurrentActor != actor)
             {
-                return null;
+                return new List<CAbilityAttack>();
             }
+            List<CAbility> abilities = new List<CAbility>();
             if (PhaseManager.Phase is CPhaseAction actionPhase)
             {
-                CAbilityAttack sameActionAttack = actionPhase.RemainingPhaseAbilities
-                    .Select(phaseAbility => phaseAbility.m_Ability)
-                    .OfType<CAbilityAttack>()
-                    .FirstOrDefault(IsSupportedAttack);
-                if (sameActionAttack != null)
-                {
-                    return sameActionAttack;
-                }
+                abilities.AddRange(actionPhase.RemainingPhaseAbilities.Select(phaseAbility => phaseAbility.m_Ability));
             }
             lock (PlanLock)
             {
-                if (!TurnPlans.TryGetValue(actor.ActorGuid, out TurnPlan plan) ||
-                    GameState.RoundAbilityCardselected != plan.FirstCard)
+                if (TurnPlans.TryGetValue(actor.ActorGuid, out TurnPlan plan) &&
+                    GameState.RoundAbilityCardselected == plan.First.Card &&
+                    TacticalEvaluation.MatchesCommittedAction(plan.First.Action.ID,
+                        plan.First.Card.LastSelectedAction?.ID, (int)plan.First.ActionType,
+                        (int)GameState.RoundAbilityCardActionType) &&
+                    actor is CPlayerActor player &&
+                    (player.IsTakingExtraTurn ? player.CharacterClass.ExtraTurnCards :
+                        player.CharacterClass.RoundAbilityCards).Contains(plan.Followup.Card))
                 {
-                    return null;
+                    abilities.AddRange(plan.Followup.Action.Abilities);
                 }
-                if (plan.FirstCard.LastSelectedAction?.Abilities?.OfType<CAbilityHeal>().Any() == true)
-                {
-                    return null;
-                }
-                return plan.Followup?.FirstAttack;
             }
+            return AttackSegment(abilities);
+        }
+
+        private static List<CAbilityAttack> AttackSegment(IEnumerable<CAbility> abilities)
+        {
+            // Do not look through another move or an unsupported attack into a later objective.
+            return abilities.TakeWhile(ability => !(ability is CAbilityMove) &&
+                    !(ability is CAbilityAttack attack && !IsSupportedAttack(attack)))
+                .OfType<CAbilityAttack>().ToList();
+        }
+
+        // Returns a demonstrated total route cost, not a movement bonus. Zero means do not spend.
+        internal static int UsefulBootsPathCost(CPlayerActor actor, CAbilityMove move, int maxBonus)
+        {
+            if (actor == null || !IsSupportedMove(move) || maxBonus <= 0 || move.RemainingMoves < 0 ||
+                move.RemainingMoves > int.MaxValue - maxBonus || move.HasMoved ||
+                move.IsItemAbility || move.IsMergedAbility || actor.IsDead ||
+                move.IgnoreBlockedTileMoveCost || GameState.InternalCurrentActor != actor ||
+                !(PhaseManager.Phase is CPhaseAction phase) || phase.CurrentPhaseAbility?.m_Ability != move ||
+                move.State != CAbilityMove.EMoveState.ActorIsSelectingMoveTile ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Immobilize) ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Stun) ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Sleep))
+            {
+                return 0;
+            }
+            List<CAbilityAttack> attacks = GetFollowupAttacks(actor);
+            if (attacks.Count == 0 || attacks.Any(attack => BestCurrentAttackScore(actor, attack) > 0f) ||
+                !HasPotentialAttackTarget(actor, attacks, move.RemainingMoves + maxBonus))
+            {
+                return 0;
+            }
+
+            int current = move.RemainingMoves;
+            int budget = current + maxBonus;
+            int bestCost = int.MaxValue;
+            foreach (CTile tile in MoveDestinationCandidates(actor, budget))
+            {
+                // Filter firing positions before doing any path searches. Never spend on a blank attack.
+                float endpointScore = ScoreMoveEndpoint(actor, attacks, tile.m_ArrayIndex, out float attackValue);
+                if (attackValue <= 0f)
+                {
+                    continue;
+                }
+                int currentCost = MovePathCost(actor, move, tile, budget: current);
+                if (currentCost <= current)
+                {
+                    return 0;
+                }
+                int boostedCost = MovePathCost(actor, move, tile, budget: budget);
+                if (boostedCost == int.MaxValue || boostedCost > budget)
+                {
+                    continue;
+                }
+                // A larger item bonus can switch the engine back to its preferred route.
+                // That route must also be safe, not just the shorter fallback at a tight budget.
+                int cost = Math.Min(currentCost, boostedCost);
+                if (cost > current && cost <= budget && cost < bestCost &&
+                    endpointScore > 0.2f)
+                {
+                    bestCost = cost;
+                }
+            }
+            // No speculative door spending: opening an unknown room does not prove useful boots.
+            return bestCost == int.MaxValue ? 0 : bestCost;
         }
 
         internal static CTile ChooseMoveDestination(CPlayerActor actor, CAbilityMove move)
         {
-            if (actor == null || !IsSupportedMove(move))
+            if (actor == null || !IsSupportedMove(move) || TileAt(actor.ArrayIndex) == null ||
+                ScenarioManager.Scenario == null || ScenarioManager.PathFinder?.Nodes == null ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Immobilize))
             {
                 return null;
             }
 
-            CAbilityAttack followupAttack = GetFollowupAttack(actor);
-            int desiredRange = EffectiveAttackRange(actor, followupAttack);
-            if (followupAttack != null && HasAttackTargetFrom(actor, followupAttack, actor.ArrayIndex,
-                    desiredRange))
+            List<CAbilityAttack> attacks = GetFollowupAttacks(actor);
+            int desiredRange = attacks.Select(attack => EffectiveAttackRange(actor, attack)).DefaultIfEmpty(1).Max();
+            List<CTile> legalDestinations = null;
+            CTile currentTile = ScenarioManager.Tiles[actor.ArrayIndex.X, actor.ArrayIndex.Y];
+            if (HasPotentialAttackTarget(actor, attacks, move.RemainingMoves))
             {
-                return ScenarioManager.Tiles[actor.ArrayIndex.X, actor.ArrayIndex.Y];
-            }
-
-            List<CTile> legalDestinations = GameState.GetTilesInRange(actor, move.RemainingMoves,
-                CAbility.EAbilityTargeting.Range, emptyTilesOnly: true,
-                ignoreBlocked: move.Jump || move.Fly, innerRange: null, ignorePathLength: false,
-                ignoreBlockedWithActor: false, ignoreLOS: true, emptyOpenDoorTiles: true,
-                ignoreMoveCost: false, ignoreDifficultTerrain: true)
-                .Where(tile => IsReachableMoveDestination(actor, move, tile))
-                .ToList();
-            if (followupAttack != null)
-            {
-                CTile attackDestination = legalDestinations
-                    .Where(tile => HasAttackTargetFrom(actor, followupAttack, tile.m_ArrayIndex,
-                        desiredRange))
-                    .OrderByDescending(tile => ScoreMoveEndpoint(actor, followupAttack,
-                        tile.m_ArrayIndex, desiredRange))
-                    .ThenBy(tile => ScenarioManager.GetTileDistance(actor.ArrayIndex.X,
-                        actor.ArrayIndex.Y, tile.m_ArrayIndex.X, tile.m_ArrayIndex.Y))
-                    .FirstOrDefault();
-                if (attackDestination != null)
+                legalDestinations = ReachableMoveDestinations(actor, move, move.RemainingMoves);
+                if (new[] { currentTile }.Concat(legalDestinations).Any(tile => tile != null &&
+                    attacks.Any(attack => HasAttackTargetFrom(actor, attack, tile.m_ArrayIndex,
+                        EffectiveAttackRange(actor, attack)))))
                 {
-                    return attackDestination;
+                    return ChooseAttackEndpoint(actor, attacks, legalDestinations, true, out _, out _);
                 }
             }
 
-            actor.Move(move.RemainingMoves, move.Jump, move.Fly, desiredRange, allowMove: false,
-                move.IgnoreDifficultTerrain, followupAttack, firstMove: true, moveTest: false,
-                move.CarryOtherActorsOnHex);
-            List<Point> path = actor.AIMoveFocusPath;
-            if (path == null || path.Count == 0)
+            // Find a route to a firing position without invoking the stateful actor.Move AI routine.
+            CTile approach = null;
+            int bestCost = int.MaxValue;
+            foreach (CActor target in HostileActors(actor))
             {
-                return ChooseClosedDoorDestination(actor, move, legalDestinations);
+                if (attacks.Count > 0 && !attacks.Any(attack => IsValidTarget(actor, target, attack)))
+                {
+                    continue;
+                }
+                CTile targetTile = ScenarioManager.Tiles[target.ArrayIndex.X, target.ArrayIndex.Y];
+                if (currentTile != null && targetTile != null && Distance(actor, target) <= desiredRange &&
+                    CActor.HaveLOS(currentTile, targetTile))
+                {
+                    approach = currentTile;
+                    bestCost = 0;
+                }
+                foreach (CTile goal in MoveDestinationCandidates(actor, desiredRange, target.ArrayIndex))
+                {
+                    if (targetTile == null || !CActor.HaveLOS(goal, targetTile) ||
+                        attacks.Count > 0 && !attacks.Any(attack => HasAttackTargetFrom(actor, attack,
+                            goal.m_ArrayIndex, EffectiveAttackRange(actor, attack))))
+                    {
+                        continue;
+                    }
+                    bool foundPath;
+                    List<Point> path = CActor.FindCharacterPath(actor, actor.ArrayIndex,
+                        goal.m_ArrayIndex, move.Jump || move.Fly, ignoreMoveCost: false,
+                        out foundPath, avoidTraps: true, move.IgnoreDifficultTerrain,
+                        move.IgnoreHazardousTerrain, move.CarryOtherActorsOnHex);
+                    if (!foundPath || !IsSafeMovePath(actor, move, path, goal))
+                    {
+                        continue;
+                    }
+                    int cost = CAbilityMove.CalculateMoveCost(path, !move.Fly, !move.Jump,
+                        ignoreMoveCost: false, move.IgnoreDifficultTerrain, move.IgnoreBlockedTileMoveCost);
+                    if (cost >= bestCost)
+                    {
+                        continue;
+                    }
+                    CTile destination = ReachablePathEndpoint(actor, move, path, legalDestinations);
+                    if (destination != null)
+                    {
+                        bestCost = cost;
+                        approach = destination;
+                    }
+                }
             }
-
-            return path
-                .Select(point => ScenarioManager.Tiles[point.X, point.Y])
-                .LastOrDefault(legalDestinations.Contains) ??
-                ChooseClosedDoorDestination(actor, move, legalDestinations);
+            CTile result = approach ?? ChooseClosedDoorDestination(actor, move, legalDestinations);
+            if (result != null && DeveloperDiagnostics.Enabled)
+            {
+                DeveloperDiagnostics.Record("move_candidate", actor, string.Format(CultureInfo.InvariantCulture,
+                    "action=move;x={0};y={1};reason={2}", result.m_ArrayIndex.X, result.m_ArrayIndex.Y,
+                    approach == null ? "door" : "best_score"));
+            }
+            return result;
         }
 
         internal static CAbilityCard ChooseCardToLose(CPlayerActor actor, IEnumerable<CAbilityCard> cards)
@@ -294,6 +416,7 @@ namespace GloomhavenPartyAI
                 attack.AbilityFilter != null &&
                 attack.AbilityFilter.HasTargetTypeFlag(CAbilityFilter.EFilterTargetType.Enemy, exclusive: true) &&
                 attack.MiscAbilityData?.TargetOneEnemyWithAllAttacks != true &&
+                (attack.MiscAbilityData?.IgnorePreviousAbilityTargets?.Count ?? 0) == 0 &&
                 (attack.AttackEffects == null || attack.AttackEffects.Count == 0) &&
                 (attack.StartAbilityRequirements == null ||
                  attack.StartAbilityRequirements.StartAbilityRequirementType ==
@@ -344,18 +467,30 @@ namespace GloomhavenPartyAI
 
         internal static float ScoreAttackTarget(CActor attacker, CActor target, CAbilityAttack attack)
         {
+            if (attacker == null || target == null || attack == null)
+            {
+                return 0f;
+            }
+            float score = ScoreAttackTargetFrom(attacker, target, attack, attacker.ArrayIndex);
+            if (DeveloperDiagnostics.Enabled)
+            {
+                DeveloperDiagnostics.Record("target_candidate", attacker, string.Format(CultureInfo.InvariantCulture,
+                    "action=attack;score={0};x={1};y={2};targets=1", score, target.ArrayIndex.X, target.ArrayIndex.Y));
+            }
+            return score;
+        }
+
+        private static float ScoreAttackTargetFrom(CActor attacker, CActor target, CAbilityAttack attack,
+            Point position)
+        {
             int shield = Math.Max(0, target.CalculateShield(attack) - attack.Pierce);
             int damage = Math.Max(0, attack.Strength - shield);
-            float effectiveDamage = Math.Min(target.Health, damage);
-            float score = effectiveDamage * 4f;
-            if (damage >= target.Health)
-            {
-                score += target.ActorActionHasHappened ? 14f : 26f;
-                score -= Math.Max(0, damage - target.Health) * 2f;
-            }
-            score += ThreatValue(target);
-            score += ScoreConditions(attack, target);
-            return score;
+            bool rangedAdjacent = EffectiveAttackRange(attacker, attack) > 1 &&
+                ScenarioManager.GetTileDistance(position.X, position.Y,
+                    target.ArrayIndex.X, target.ArrayIndex.Y) == 1;
+            return TacticalEvaluation.AttackValue(damage, target.Health, target.ActorActionHasHappened,
+                    rangedAdjacent) + ScoreConditions(attack, target,
+                    TacticalEvaluation.IsProjectedKill(damage, target.Health, rangedAdjacent));
         }
 
         internal static float ScoreHealTarget(CActor target, CAbilityHeal heal)
@@ -363,68 +498,123 @@ namespace GloomhavenPartyAI
             return ScoreHealTarget(target, heal?.ModifiedStrength() ?? 0);
         }
 
-        private static float ScorePair(CPlayerActor actor, CAbilityCard first, CAbilityCard second)
+        private static float ScorePair(CPlayerActor actor, CAbilityCard first, CAbilityCard second,
+            Dictionary<Tuple<CPlayerActor, int, int>, List<CTile>> reachable)
         {
-            PlannedAction firstTop = BestHalf(actor, first, top: true);
-            PlannedAction firstBottom = BestHalf(actor, first, top: false);
-            PlannedAction secondTop = BestHalf(actor, second, top: true);
-            PlannedAction secondBottom = BestHalf(actor, second, top: false);
-            PlannedAction[][] sequences =
+            List<TurnPlan> sequences = EvaluatePlans(actor, first, second, reachable);
+            if (sequences.Count == 0)
             {
-                BuildOrderedSequence(actor, firstTop, secondBottom),
-                BuildOrderedSequence(actor, secondBottom, firstTop),
-                BuildOrderedSequence(actor, secondTop, firstBottom),
-                BuildOrderedSequence(actor, firstBottom, secondTop)
-            };
-            float orientationOne = Math.Max(ScoreOrientation(actor, sequences[0][0], sequences[0][1]),
-                ScoreOrientation(actor, sequences[1][0], sequences[1][1]));
-            float orientationTwo = Math.Max(ScoreOrientation(actor, sequences[2][0], sequences[2][1]),
-                ScoreOrientation(actor, sequences[3][0], sequences[3][1]));
-            float flexibility = Math.Min(orientationOne, orientationTwo) * 0.18f;
+                return float.MinValue;
+            }
+            float orientationOne = sequences
+                .Where(plan => (plan.First.IsTop ? plan.First.Card : plan.Followup.Card) == first)
+                .Select(plan => plan.Score).DefaultIfEmpty(0f).Max();
+            float orientationTwo = sequences
+                .Where(plan => (plan.First.IsTop ? plan.First.Card : plan.Followup.Card) == second)
+                .Select(plan => plan.Score).DefaultIfEmpty(0f).Max();
+            float flexibility = Math.Max(0f, Math.Min(orientationOne, orientationTwo)) * 0.18f;
             float initiativeCoverage = Math.Abs(first.Initiative - second.Initiative) >= 25 ? 0.75f : 0f;
-            float execution = sequences.Max(sequence => ScoreActionOrder(actor, sequence[0], sequence[1]));
-            return execution + flexibility + initiativeCoverage;
-        }
-
-        private static float ScoreOrientation(CPlayerActor actor, PlannedAction top, PlannedAction bottom)
-        {
-            float score = top.Score + bottom.Score;
-            CAbilityAttack attack = top.FirstAttack ?? bottom.FirstAttack;
-            CAbilityMove move = bottom.FirstMove ?? top.FirstMove;
-            if (attack != null && move != null)
+            float score = sequences.Max(sequence => sequence.Score) + flexibility + initiativeCoverage;
+            if (DeveloperDiagnostics.Enabled)
             {
-                int gap = Math.Max(0, NearestEnemyDistance(actor) - Math.Max(1, attack.Range));
-                int movement = PlannedMoveStrength(actor, move);
-                if (movement >= gap)
-                {
-                    score += attack.Strength * 1.4f;
-                }
-                score += Math.Min(movement, gap) * 0.8f;
+                DeveloperDiagnostics.Record("pair_candidate", actor, string.Format(CultureInfo.InvariantCulture,
+                    "action=cards;score={0};first_card_id={1};second_card_id={2}", score, first.ID, second.ID));
             }
             return score;
         }
 
-        private static float ScoreActionOrder(CPlayerActor actor, PlannedAction first,
-            PlannedAction second)
+        private static List<TurnPlan> EvaluatePlans(CPlayerActor actor, CAbilityCard first,
+            CAbilityCard second, Dictionary<Tuple<CPlayerActor, int, int>, List<CTile>> reachable = null,
+            bool recordCandidates = false)
         {
-            float score = first.Score + second.Score;
-            if (first.FirstAttack != null)
+            List<TurnPlan> plans = new List<TurnPlan>();
+            reachable = reachable ?? new Dictionary<Tuple<CPlayerActor, int, int>, List<CTile>>();
+            foreach (bool firstIsTop in new[] { true, false })
             {
-                float immediateAttack = BestCurrentAttackScore(actor, first.FirstAttack);
-                score += immediateAttack > 0f
-                    ? immediateAttack * 0.2f
-                    : -Math.Max(2f, first.FirstAttack.Strength * 1.5f);
-            }
-
-            if (first.FirstMove != null && second.FirstAttack != null)
-            {
-                float immediateAttack = BestCurrentAttackScore(actor, second.FirstAttack);
-                float reachableAttack = BestApproachableAttackScore(actor, second.FirstAttack,
-                    PlannedMoveStrength(actor, first.FirstMove));
-                score += reachableAttack * 0.22f;
-                if (immediateAttack > 0f && reachableAttack <= immediateAttack + 2f)
+                List<PlannedAction> firstOptions = HalfOptions(actor, first, firstIsTop).ToList();
+                List<PlannedAction> secondOptions = HalfOptions(actor, second, !firstIsTop).ToList();
+                foreach (PlannedAction firstOption in firstOptions)
                 {
-                    score -= 2f;
+                    foreach (PlannedAction secondOption in secondOptions)
+                    {
+                        foreach (bool firstActsFirst in new[] { true, false })
+                        {
+                            PlannedAction[] sequence = BuildOrderedSequence(actor,
+                                firstActsFirst ? firstOption : secondOption,
+                                firstActsFirst ? secondOption : firstOption);
+                            float score = ScoreActionOrder(actor, sequence[0], sequence[1], reachable,
+                                out float attackValue);
+                            if (recordCandidates)
+                            {
+                                RecordActionCandidate(actor, sequence[0], sequence[1], score);
+                            }
+                            plans.Add(new TurnPlan
+                            {
+                                First = sequence[0],
+                                Followup = sequence[1],
+                                Score = score,
+                                AttackValue = attackValue
+                            });
+                        }
+                    }
+                }
+            }
+            return plans;
+        }
+
+        private static void RecordActionCandidate(CPlayerActor actor, PlannedAction first,
+            PlannedAction second, float score)
+        {
+            if (!DeveloperDiagnostics.Enabled)
+            {
+                return;
+            }
+            string action = first.Action.Abilities[0] is CAbilityAttack ? "attack" :
+                first.Action.Abilities[0] is CAbilityHeal ? "heal" : "move";
+            DeveloperDiagnostics.Record("action_candidate", actor, string.Format(CultureInfo.InvariantCulture,
+                "action={0};score={1};card_id={2};first_card_id={2};second_card_id={3};top_card_id={4};" +
+                "bottom_card_id={5};default_action={6};initiative={7}", action, score, first.Card.ID,
+                second?.Card.ID ?? -1, first.IsTop ? first.Card.ID : second?.Card.ID ?? -1,
+                first.IsTop ? second?.Card.ID ?? -1 : first.Card.ID,
+                first.ActionType == CBaseCard.ActionType.DefaultAttackAction ||
+                    first.ActionType == CBaseCard.ActionType.DefaultMoveAction ? 1 : 0, first.Card.Initiative));
+        }
+
+        private static float ScoreActionOrder(CPlayerActor actor, PlannedAction first,
+            PlannedAction second, Dictionary<Tuple<CPlayerActor, int, int>, List<CTile>> reachable,
+            out float attackValue)
+        {
+            float score = first.Score + (second?.Score ?? 0f);
+            attackValue = 0f;
+            List<CAbility> abilities = new[] { first, second }.Where(value => value != null)
+                .SelectMany(action => action.Action.Abilities).ToList();
+            bool afterMove = false;
+            for (int index = 0; index < abilities.Count; index++)
+            {
+                if (abilities[index] is CAbilityMove move)
+                {
+                    afterMove = true;
+                    List<CAbilityAttack> attacks = AttackSegment(abilities.Skip(index + 1));
+                    if (attacks.Count == 0)
+                    {
+                        continue;
+                    }
+                    int budget = PlannedMoveStrength(actor, move);
+                    // Empty rooms and targets outside the possible reach need no engine path searches.
+                    List<CTile> destinations = HasPotentialAttackTarget(actor, attacks, budget)
+                        ? ReachableMoveDestinations(actor, move, budget, reachable) : new List<CTile>();
+                    float immediate = attacks.Sum(attack => BestCurrentAttackScore(actor, attack));
+                    // Use the same endpoint objective and tie-breaking as actual movement.
+                    ChooseAttackEndpoint(actor, attacks, destinations, false,
+                        out float endpointScore, out float endpointAttackValue);
+                    score += endpointScore - immediate;
+                    attackValue += endpointAttackValue;
+                }
+                else if (!afterMove && abilities[index] is CAbilityAttack attack)
+                {
+                    float immediate = BestCurrentAttackScore(actor, attack);
+                    score += immediate * 0.1f;
+                    attackValue += immediate;
                 }
             }
             return score;
@@ -439,16 +629,19 @@ namespace GloomhavenPartyAI
                 bool canForecast = first.Action.Abilities.Count == 1 &&
                     CActiveBonus.FindApplicableActiveBonuses(actor,
                         CAbility.EAbilityType.AddTarget).Count == 0;
-                followup = BestHalf(actor, second.Card, second.IsTop, discourageRoutineHeal: true,
-                    precedingHeal: canForecast ? first.FirstHeal : null,
-                    forceHealPenalty: !canForecast);
+                followup = new PlannedAction
+                {
+                    Card = second.Card,
+                    ActionType = second.ActionType,
+                    Action = second.Action,
+                    Score = second.Score
+                };
+                PenalizeRoutineHeal(actor, followup, canForecast ? first.FirstHeal : null, !canForecast);
             }
             return new[] { first, followup };
         }
 
-        private static PlannedAction BestHalf(CPlayerActor actor, CAbilityCard card, bool top,
-            bool discourageRoutineHeal = false, CAbilityHeal precedingHeal = null,
-            bool forceHealPenalty = false)
+        private static IEnumerable<PlannedAction> HalfOptions(CPlayerActor actor, CAbilityCard card, bool top)
         {
             CBaseCard.ActionType printedType = top
                 ? CBaseCard.ActionType.TopAction
@@ -458,20 +651,14 @@ namespace GloomhavenPartyAI
                 : CBaseCard.ActionType.DefaultMoveAction;
             PlannedAction printed = BuildOption(actor, card, printedType);
             PlannedAction fallback = BuildOption(actor, card, defaultType);
-            if (discourageRoutineHeal)
+            if (fallback != null)
             {
-                PenalizeRoutineHeal(actor, printed, precedingHeal, forceHealPenalty);
-                PenalizeRoutineHeal(actor, fallback, precedingHeal, forceHealPenalty);
+                yield return fallback;
             }
-            if (printed == null)
+            if (printed != null)
             {
-                return fallback;
+                yield return printed;
             }
-            if (fallback == null)
-            {
-                return printed;
-            }
-            return printed.Score > fallback.Score + 0.2f ? printed : fallback;
         }
 
         private static PlannedAction BuildOption(CPlayerActor actor, CAbilityCard card,
@@ -538,7 +725,7 @@ namespace GloomhavenPartyAI
                 }
                 else if (ability is CAbilityAttack attack)
                 {
-                    score += ScoreAttack(actor, attack);
+                    score += BestCurrentAttackScore(actor, attack);
                 }
                 else if (ability is CAbilityHeal heal)
                 {
@@ -551,27 +738,9 @@ namespace GloomhavenPartyAI
                 int cyclingCards = actor.CharacterClass.HandAbilityCards.Count +
                     actor.CharacterClass.DiscardedAbilityCards.Count +
                     actor.CharacterClass.RoundAbilityCards.Count;
-                int turnsLost = Math.Max(1, (cyclingCards - 1) / 2);
-                float endgameFactor = HostileActors(actor).Count <= 2 ? 0.35f : 1f;
-                score -= turnsLost * 5f * endgameFactor;
+                score -= TacticalEvaluation.LossPenalty(cyclingCards);
             }
             return score;
-        }
-
-        private static float ScoreAttack(CPlayerActor actor, CAbilityAttack attack)
-        {
-            int range = Math.Max(1, attack.Range);
-            List<CActor> targets = HostileActors(actor)
-                .Where(target => IsValidTarget(actor, target, attack) &&
-                    Distance(actor, target) <= range && HasLineOfSight(actor, target))
-                .OrderByDescending(target => ScoreStaticAttackTarget(target, attack))
-                .ToList();
-            int targetCount = Math.Max(1, attack.NumberTargets);
-            if (targets.Count == 0)
-            {
-                return Math.Max(0, attack.Strength) * 0.65f + Math.Max(0, range - 1) * 0.3f;
-            }
-            return targets.Take(targetCount).Sum(target => ScoreStaticAttackTarget(target, attack));
         }
 
         private static float BestCurrentAttackScore(CPlayerActor actor, CAbilityAttack attack)
@@ -580,42 +749,14 @@ namespace GloomhavenPartyAI
             {
                 return 0f;
             }
-            int range = EffectiveAttackRange(actor, attack);
-            return HostileActors(actor)
-                .Where(target => IsValidTarget(actor, target, attack) &&
-                    Distance(actor, target) <= range && HasLineOfSight(actor, target))
-                .Select(target => ScoreAttackTarget(actor, target, attack))
-                .DefaultIfEmpty(0f)
-                .Max();
+            return BestAttackScoreFrom(actor, attack, actor.ArrayIndex);
         }
 
-        private static float BestApproachableAttackScore(CPlayerActor actor, CAbilityAttack attack,
-            int movement)
+        private static float BestAttackScoreFrom(CPlayerActor actor, CAbilityAttack attack, Point position)
         {
-            if (attack == null)
-            {
-                return 0f;
-            }
-            int reach = Math.Max(0, movement) + EffectiveAttackRange(actor, attack);
-            return HostileActors(actor)
-                .Where(target => IsValidTarget(actor, target, attack) && Distance(actor, target) <= reach)
-                .Select(target => ScoreAttackTarget(actor, target, attack))
-                .DefaultIfEmpty(0f)
-                .Max();
-        }
-
-        private static float ScoreStaticAttackTarget(CActor target, CAbilityAttack attack)
-        {
-            int shield = Math.Max(0, target.CalculateShield(attack) - attack.Pierce);
-            int damage = Math.Max(0, attack.Strength - shield);
-            float score = Math.Min(target.Health, damage) * 3f;
-            if (damage >= target.Health)
-            {
-                score += target.ActorActionHasHappened ? 8f : 15f;
-                score -= Math.Max(0, damage - target.Health) * 1.5f;
-            }
-            score += ScoreConditions(attack, target);
-            return score;
+            return AttackTargetsFrom(actor, attack, position, EffectiveAttackRange(actor, attack))
+                .Select(target => ScoreAttackTargetFrom(actor, target, attack, position))
+                .DefaultIfEmpty(0f).Max();
         }
 
         private static float ScoreHeal(CPlayerActor actor, CAbilityHeal heal)
@@ -731,7 +872,7 @@ namespace GloomhavenPartyAI
                 .Sum(activeBonus => activeBonus.ReferenceStrength(heal, actor));
         }
 
-        private static float ScoreConditions(CAbilityAttack attack, CActor target)
+        private static float ScoreConditions(CAbilityAttack attack, CActor target, bool projectedKill)
         {
             if (attack?.NegativeConditions == null)
             {
@@ -744,78 +885,253 @@ namespace GloomhavenPartyAI
                 {
                     continue;
                 }
+                float value;
                 switch (condition)
                 {
                     case CCondition.ENegativeCondition.Stun:
-                    case CCondition.ENegativeCondition.Sleep:
-                        score += target.ActorActionHasHappened ? 2f : 12f;
+                        value = TacticalEvaluation.ControlConditionValue(12f, target.ActorActionHasHappened);
                         break;
                     case CCondition.ENegativeCondition.Disarm:
-                        score += target.ActorActionHasHappened ? 1f : 9f;
+                        value = TacticalEvaluation.ControlConditionValue(9f, target.ActorActionHasHappened);
+                        break;
+                    case CCondition.ENegativeCondition.Sleep:
+                        value = TacticalEvaluation.ControlConditionValue(10f, target.ActorActionHasHappened);
                         break;
                     case CCondition.ENegativeCondition.Immobilize:
-                        score += target.ActorActionHasHappened ? 1f : 5f;
+                        value = TacticalEvaluation.ControlConditionValue(5f, target.ActorActionHasHappened);
                         break;
                     case CCondition.ENegativeCondition.Poison:
                     case CCondition.ENegativeCondition.Wound:
-                        score += 4f;
+                        value = 4f;
                         break;
                     case CCondition.ENegativeCondition.Muddle:
                     case CCondition.ENegativeCondition.Curse:
-                        score += 3f;
+                        value = 3f;
                         break;
                     default:
-                        score += 1f;
+                        value = 1f;
                         break;
                 }
+                // Curse affects the shared modifier deck even if this target dies.
+                score += TacticalEvaluation.ConditionValue(value, projectedKill,
+                    condition == CCondition.ENegativeCondition.Curse);
             }
             return score;
         }
 
         private static float ScoreFutureCard(CPlayerActor actor, CAbilityCard card)
         {
-            PlannedAction top = BestHalf(actor, card, top: true);
-            PlannedAction bottom = BestHalf(actor, card, top: false);
-            float initiativeCoverage = card.Initiative <= 25 || card.Initiative >= 75 ? 1.5f : 0f;
-            return (top?.Score ?? 0f) + (bottom?.Score ?? 0f) + initiativeCoverage;
+            float score = TacticalEvaluation.FutureCardValue(ScoreIntrinsicAction(card.TopAction),
+                ScoreIntrinsicAction(card.BottomAction), card.Initiative);
+            List<CAbilityCard> others = actor.CharacterClass.HandAbilityCards
+                .Concat(actor.CharacterClass.DiscardedAbilityCards)
+                .Concat(actor.CharacterClass.RoundAbilityCards)
+                .Concat(actor.CharacterClass.ExtraTurnCards)
+                .Where(other => other != card).Distinct().ToList();
+            foreach (CAbility.EAbilityType role in new[] { CAbility.EAbilityType.Attack,
+                CAbility.EAbilityType.Move, CAbility.EAbilityType.Heal })
+            {
+                if (HasReusableRole(card, role))
+                {
+                    score += TacticalEvaluation.RoleScarcityValue(
+                        others.Count(other => HasReusableRole(other, role)));
+                }
+            }
+            return score;
         }
 
-        private static bool HasAttackTarget(CPlayerActor actor, CAbilityAttack attack)
+        private static bool HasReusableRole(CAbilityCard card, CAbility.EAbilityType role)
         {
-            if (attack == null)
+            return new[] { card.TopAction, card.BottomAction }.Any(action => action?.Abilities != null &&
+                action.CardPile != CBaseCard.ECardPile.Lost &&
+                action.CardPile != CBaseCard.ECardPile.PermanentlyLost && action.Abilities.Any(ability =>
+                    role == CAbility.EAbilityType.Move
+                        ? ability is CAbilityMove move && PrintedStrength(move, EEnhancement.PlusMove) >= 3
+                        : role == CAbility.EAbilityType.Attack
+                            ? ability is CAbilityAttack attack && PrintedStrength(attack, EEnhancement.PlusAttack) >= 3
+                            : ability is CAbilityHeal heal && PrintedStrength(heal, EEnhancement.PlusHeal) > 0));
+        }
+
+        private static float ScoreIntrinsicAction(CAction action)
+        {
+            if (action?.Abilities == null)
             {
-                return false;
+                return 0f;
             }
-            int range = Math.Max(1, attack.Range);
-            return HostileActors(actor).Any(target => IsValidTarget(actor, target, attack) &&
-                Distance(actor, target) <= range && HasLineOfSight(actor, target));
+            float score = 0f;
+            foreach (CAbility ability in action.Abilities)
+            {
+                if (ability is CAbilityAttack attack)
+                {
+                    score += Math.Max(0, PrintedStrength(attack, EEnhancement.PlusAttack)) * 3f *
+                        Math.Max(1, Math.Min(3, attack.NumberTargets));
+                    score += Math.Max(0, attack.Range - 1) * 0.5f + Math.Max(0, attack.Pierce) * 0.5f;
+                    score += (attack.NegativeConditions?.Count ?? 0) * 2f;
+                }
+                else if (ability is CAbilityMove move)
+                {
+                    score += Math.Max(0, PrintedStrength(move, EEnhancement.PlusMove)) * 1.6f +
+                        (move.Jump || move.Fly ? 1.5f : 0f);
+                }
+                else if (ability is CAbilityHeal heal)
+                {
+                    score += Math.Max(0, PrintedStrength(heal, EEnhancement.PlusHeal)) * 1.25f *
+                        Math.Max(1, Math.Min(3, heal.NumberTargets)) + 2f;
+                }
+                else
+                {
+                    // Unsupported printed utility is not worthless just because we cannot automate it.
+                    score += 3f;
+                }
+            }
+            return score * (action.CardPile == CBaseCard.ECardPile.Lost ||
+                action.CardPile == CBaseCard.ECardPile.PermanentlyLost ? 0.5f : 1f);
         }
 
         private static bool HasAttackTargetFrom(CPlayerActor actor, CAbilityAttack attack,
             Point position, int range)
         {
-            CTile sourceTile = ScenarioManager.Tiles[position.X, position.Y];
-            return sourceTile != null && HostileActors(actor).Any(target =>
+            return AttackTargetsFrom(actor, attack, position, range).Any();
+        }
+
+        private static IEnumerable<CActor> AttackTargetsFrom(CPlayerActor actor, CAbilityAttack attack,
+            Point position, int range)
+        {
+            CTile sourceTile = TileAt(position);
+            if (actor == null || !IsSupportedAttack(attack) || !IsValidMoveEndpoint(actor, sourceTile) ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Disarm) ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Stun) ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Sleep) ||
+                // Non-target filters can depend on the attacker's real position; do not fake that state.
+                position != actor.ArrayIndex && attack.AbilityFilter.HasNonTargetTypeFilters())
             {
-                if (!IsValidTarget(actor, target, attack) ||
+                yield break;
+            }
+            foreach (CActor target in HostileActors(actor))
+            {
+                if (!IsValidTarget(actor, target, attack) || attack.ActorsToIgnore?.Contains(target) == true ||
                     ScenarioManager.GetTileDistance(position.X, position.Y,
                         target.ArrayIndex.X, target.ArrayIndex.Y) > range)
                 {
-                    return false;
+                    continue;
                 }
-                CTile targetTile = ScenarioManager.Tiles[target.ArrayIndex.X, target.ArrayIndex.Y];
-                return targetTile != null && CActor.HaveLOS(sourceTile, targetTile);
+                CTile targetTile = TileAt(target.ArrayIndex);
+                if (targetTile != null &&
+                    (targetTile.m_HexMap?.Revealed == true || targetTile.m_Hex2Map?.Revealed == true) &&
+                    CActor.HaveLOS(sourceTile, targetTile))
+                {
+                    yield return target;
+                }
+            }
+        }
+
+        private static CTile TileAt(Point position)
+        {
+            CTile[,] tiles = ScenarioManager.Tiles;
+            return tiles != null && position.X >= 0 && position.Y >= 0 &&
+                position.X < tiles.GetLength(0) && position.Y < tiles.GetLength(1)
+                ? tiles[position.X, position.Y] : null;
+        }
+
+        private static bool IsValidMoveEndpoint(CPlayerActor actor, CTile tile, bool allowClosedDoor = false)
+        {
+            if (actor == null || tile == null || ScenarioManager.Scenario == null ||
+                ScenarioManager.PathFinder?.Nodes == null ||
+                tile.m_HexMap?.Revealed != true && tile.m_Hex2Map?.Revealed != true)
+            {
+                return false;
+            }
+            Point position = tile.m_ArrayIndex;
+            if (TileAt(position) != tile || position.X >= ScenarioManager.PathFinder.Nodes.GetLength(0) ||
+                position.Y >= ScenarioManager.PathFinder.Nodes.GetLength(1))
+            {
+                return false;
+            }
+            var node = ScenarioManager.PathFinder.Nodes[position.X, position.Y];
+            if (node == null || !node.Walkable || node.Blocked ||
+                ScenarioManager.Scenario.FindActorsAt(position).Any(other => other != actor))
+            {
+                return false;
+            }
+            CObjectDoor door = tile.FindProp(ScenarioManager.ObjectImportType.Door) as CObjectDoor;
+            return door == null || door.DoorIsOpen || allowClosedDoor && !door.DoorIsLocked &&
+                !door.IsDungeonEntrance && !door.IsDungeonExit &&
+                !(door.PropHealthDetails != null && door.PropHealthDetails.HasHealth &&
+                    door.PropHealthDetails.CurrentHealth > 0);
+        }
+
+        private static IEnumerable<CTile> MoveDestinationCandidates(CPlayerActor actor, int budget,
+            Point? center = null)
+        {
+            if (actor == null || budget <= 0 || TileAt(actor.ArrayIndex) == null ||
+                ScenarioManager.Scenario == null || ScenarioManager.PathFinder?.Nodes == null)
+            {
+                return Enumerable.Empty<CTile>();
+            }
+            Point origin = center ?? actor.ArrayIndex;
+            if (TileAt(origin) == null)
+            {
+                return Enumerable.Empty<CTile>();
+            }
+            // This overload can skip the game's redundant path/LOS prefilter. Endpoint and actual
+            // actor-specific path validation happen below, including the real hex-radius bound.
+            int radius = Math.Min(budget, Math.Max(ScenarioManager.Width, ScenarioManager.Height));
+            return GameState.GetTilesInRange(origin, radius, CAbility.EAbilityTargeting.Range,
+                    emptyTilesOnly: false, ignorePathLength: true, ignoreLOS: true,
+                    allowClosedDoorTiles: true, skipPathingCheck: true)
+                .Where(tile => IsValidMoveEndpoint(actor, tile, allowClosedDoor: true) &&
+                    tile.m_ArrayIndex != actor.ArrayIndex &&
+                    ScenarioManager.GetTileDistance(origin.X, origin.Y,
+                        tile.m_ArrayIndex.X, tile.m_ArrayIndex.Y) <= budget);
+        }
+
+        private static bool HasPotentialAttackTarget(CPlayerActor actor, List<CAbilityAttack> attacks, int movement)
+        {
+            if (actor == null || attacks.Count == 0 ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Disarm) ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Stun) ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Sleep))
+            {
+                return false;
+            }
+            return HostileActors(actor).Any(target =>
+            {
+                CTile tile = TileAt(target.ArrayIndex);
+                return tile != null && (tile.m_HexMap?.Revealed == true || tile.m_Hex2Map?.Revealed == true) &&
+                    attacks.Any(attack => IsSupportedAttack(attack) && IsValidTarget(actor, target, attack) &&
+                        attack.ActorsToIgnore?.Contains(target) != true &&
+                        Distance(actor, target) <= (long)Math.Max(0, movement) + EffectiveAttackRange(actor, attack));
             });
         }
 
-        private static bool IsReachableMoveDestination(CPlayerActor actor, CAbilityMove move,
-            CTile destination)
+        private static List<CTile> ReachableMoveDestinations(CPlayerActor actor, CAbilityMove move, int budget,
+            Dictionary<Tuple<CPlayerActor, int, int>, List<CTile>> cache = null)
         {
-            return MovePathCost(actor, move, destination) <= move.RemainingMoves;
+            if (!IsSupportedMove(move) || actor == null ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Immobilize))
+            {
+                return new List<CTile>();
+            }
+            // Actor state and origin are fixed for this invocation. Share equivalent printed/default
+            // moves only after resolving their budgets, including ability-specific active bonuses.
+            var key = Tuple.Create(actor, budget, TacticalEvaluation.MovementRulesKey(move.Jump, move.Fly,
+                move.IgnoreDifficultTerrain, move.IgnoreHazardousTerrain, move.IgnoreBlockedTileMoveCost,
+                move.CarryOtherActorsOnHex));
+            if (cache != null && cache.TryGetValue(key, out List<CTile> cached))
+            {
+                return cached;
+            }
+            List<CTile> destinations = MoveDestinationCandidates(actor, budget)
+                .Where(tile => MovePathCost(actor, move, tile, budget) <= budget).ToList();
+            if (cache != null)
+            {
+                cache[key] = destinations;
+            }
+            return destinations;
         }
 
         private static int MovePathCost(CPlayerActor actor, CAbilityMove move, CTile destination,
-            bool requireSafeDoorPath = false)
+            int? budget = null)
         {
             if (actor == null || move == null || destination == null)
             {
@@ -831,9 +1147,9 @@ namespace GloomhavenPartyAI
                     ignoreMoveCost: false, move.IgnoreDifficultTerrain,
                     move.IgnoreBlockedTileMoveCost)
                 : int.MaxValue;
-            if (foundPath && cost <= move.RemainingMoves)
+            if (foundPath && cost <= (budget ?? move.RemainingMoves))
             {
-                return !requireSafeDoorPath || IsSafeClosedDoorPath(path, destination)
+                return IsSafeMovePath(actor, move, path, destination)
                     ? cost
                     : int.MaxValue;
             }
@@ -847,20 +1163,22 @@ namespace GloomhavenPartyAI
                     ignoreMoveCost: false, move.IgnoreDifficultTerrain,
                     move.IgnoreBlockedTileMoveCost)
                 : int.MaxValue;
-            return foundPath && (!requireSafeDoorPath || IsSafeClosedDoorPath(path, destination))
+            return foundPath && IsSafeMovePath(actor, move, path, destination)
                 ? cost
                 : int.MaxValue;
         }
 
-        private static bool IsSafeClosedDoorPath(List<Point> path, CTile destination)
+        private static bool IsSafeMovePath(CPlayerActor actor, CAbilityMove move, List<Point> path,
+            CTile destination)
         {
-            if (path == null || path.Count == 0 || path[path.Count - 1] != destination.m_ArrayIndex)
+            if (!IsValidMoveEndpoint(actor, destination, allowClosedDoor: true) || move == null ||
+                path == null || path.Count == 0 || path[path.Count - 1] != destination.m_ArrayIndex)
             {
                 return false;
             }
             for (int index = 0; index < path.Count; index++)
             {
-                CTile tile = ScenarioManager.Tiles[path[index].X, path[index].Y];
+                CTile tile = TileAt(path[index]);
                 if (tile == null || tile.m_HexMap?.Revealed != true && tile.m_Hex2Map?.Revealed != true)
                 {
                     return false;
@@ -869,6 +1187,31 @@ namespace GloomhavenPartyAI
                 if (index < path.Count - 1 && door != null && !door.DoorIsOpen)
                 {
                     return false;
+                }
+                bool landing = index == path.Count - 1;
+                foreach (CObjectProp prop in tile.m_Props)
+                {
+                    if (prop == null)
+                    {
+                        continue;
+                    }
+                    // Portals change the endpoint; pressure-plate consequences are not modeled.
+                    if (landing && (prop.ObjectType == ScenarioManager.ObjectImportType.Portal ||
+                        prop.ObjectType == ScenarioManager.ObjectImportType.PressurePlate))
+                    {
+                        return false;
+                    }
+                    if (prop.Activated)
+                    {
+                        continue;
+                    }
+                    bool activates = prop is CObjectDoor || !move.Fly && (!move.Jump || landing);
+                    if (activates && !(move.IgnoreHazardousTerrain && prop is CObjectHazardousTerrain) &&
+                        (prop.WillActivationDamageActor(actor) ||
+                            prop is CObjectTrap trap && trap.Conditions.Count > 0))
+                    {
+                        return false;
+                    }
                 }
             }
             return true;
@@ -911,10 +1254,7 @@ namespace GloomhavenPartyAI
                 }
                 CTile destination = doorCost <= move.RemainingMoves
                     ? doorTile
-                    : doorPath.Select(point => ScenarioManager.Tiles[point.X, point.Y])
-                        .Where(legalDestinations.Contains)
-                        .LastOrDefault(tile => MovePathCost(actor, move, tile,
-                            requireSafeDoorPath: true) <= move.RemainingMoves);
+                    : ReachablePathEndpoint(actor, move, doorPath, legalDestinations);
                 if (destination != null)
                 {
                     bestDoorCost = doorCost;
@@ -922,6 +1262,18 @@ namespace GloomhavenPartyAI
                 }
             }
             return bestDestination;
+        }
+
+        private static CTile ReachablePathEndpoint(CPlayerActor actor, CAbilityMove move, List<Point> path,
+            List<CTile> legalDestinations)
+        {
+            // Door/approach objectives do not need a full-board reachable-tile enumeration.
+            return path.AsEnumerable().Reverse().Select(TileAt).FirstOrDefault(tile =>
+                IsValidMoveEndpoint(actor, tile, allowClosedDoor: true) &&
+                ScenarioManager.GetTileDistance(actor.ArrayIndex.X, actor.ArrayIndex.Y,
+                    tile.m_ArrayIndex.X, tile.m_ArrayIndex.Y) <= move.RemainingMoves &&
+                (legalDestinations != null ? legalDestinations.Contains(tile) :
+                    MovePathCost(actor, move, tile) <= move.RemainingMoves));
         }
 
         private static List<Point> FindSafeClosedDoorPath(CPlayerActor actor, CAbilityMove move,
@@ -939,7 +1291,7 @@ namespace GloomhavenPartyAI
                     out foundPath, avoidTraps: false, move.IgnoreDifficultTerrain,
                     move.IgnoreHazardousTerrain, move.CarryOtherActorsOnHex);
             }
-            if (!foundPath || !IsSafeClosedDoorPath(path, doorTile))
+            if (!foundPath || !IsSafeMovePath(actor, move, path, doorTile))
             {
                 cost = int.MaxValue;
                 return null;
@@ -989,35 +1341,77 @@ namespace GloomhavenPartyAI
             return value;
         }
 
-        private static float ScoreMoveEndpoint(CPlayerActor actor, CAbilityAttack attack,
-            Point position, int range)
+        private static CTile ChooseAttackEndpoint(CPlayerActor actor, List<CAbilityAttack> attacks,
+            List<CTile> destinations, bool recordCandidates, out float score, out float attackValue)
         {
-            CTile sourceTile = ScenarioManager.Tiles[position.X, position.Y];
-            if (sourceTile == null)
+            CTile best = null;
+            score = float.MinValue;
+            attackValue = 0f;
+            int bestDistance = int.MaxValue;
+            foreach (CTile tile in new[] { TileAt(actor.ArrayIndex) }.Concat(destinations))
+            {
+                if (!IsValidMoveEndpoint(actor, tile))
+                {
+                    continue;
+                }
+                float value = ScoreMoveEndpoint(actor, attacks, tile.m_ArrayIndex, out float attacksValue);
+                if (recordCandidates && DeveloperDiagnostics.Enabled)
+                {
+                    DeveloperDiagnostics.Record("move_candidate", actor, string.Format(CultureInfo.InvariantCulture,
+                        "action=move;score={0};x={1};y={2}", value, tile.m_ArrayIndex.X, tile.m_ArrayIndex.Y));
+                }
+                int distance = ScenarioManager.GetTileDistance(actor.ArrayIndex.X, actor.ArrayIndex.Y,
+                    tile.m_ArrayIndex.X, tile.m_ArrayIndex.Y);
+                if (value > score || value == score && distance < bestDistance)
+                {
+                    best = tile;
+                    score = value;
+                    attackValue = attacksValue;
+                    bestDistance = distance;
+                }
+            }
+            if (best == null)
+            {
+                score = 0f;
+            }
+            return best;
+        }
+
+        private static float ScoreMoveEndpoint(CPlayerActor actor, List<CAbilityAttack> attacks,
+            Point position, out float attackValue)
+        {
+            attackValue = 0f;
+            if (!IsValidMoveEndpoint(actor, TileAt(position)))
             {
                 return float.MinValue;
             }
 
             List<CActor> hostiles = HostileActors(actor);
-            CActor bestTarget = hostiles
-                .Where(target => IsValidTarget(actor, target, attack) &&
-                    ScenarioManager.GetTileDistance(position.X, position.Y,
-                        target.ArrayIndex.X, target.ArrayIndex.Y) <= range &&
-                    CActor.HaveLOS(sourceTile,
-                        ScenarioManager.Tiles[target.ArrayIndex.X, target.ArrayIndex.Y]))
-                .OrderByDescending(target => ScoreAttackTarget(actor, target, attack))
-                .FirstOrDefault();
-            if (bestTarget == null)
+            HashSet<CActor> projectedKills = new HashSet<CActor>();
+            foreach (CAbilityAttack attack in attacks)
             {
-                return float.MinValue;
+                int range = EffectiveAttackRange(actor, attack);
+                CActor bestTarget = AttackTargetsFrom(actor, attack, position, range)
+                    .Where(target => !projectedKills.Contains(target))
+                    .OrderByDescending(target => ScoreAttackTargetFrom(actor, target, attack, position))
+                    .FirstOrDefault();
+                if (bestTarget == null)
+                {
+                    continue;
+                }
+                attackValue += ScoreAttackTargetFrom(actor, bestTarget, attack, position);
+                int shield = Math.Max(0, bestTarget.CalculateShield(attack) - attack.Pierce);
+                if (TacticalEvaluation.IsProjectedKill(attack.Strength - shield, bestTarget.Health,
+                    range > 1 && ScenarioManager.GetTileDistance(position.X, position.Y,
+                        bestTarget.ArrayIndex.X, bestTarget.ArrayIndex.Y) == 1))
+                {
+                    projectedKills.Add(bestTarget);
+                }
             }
-
-            int targetShield = Math.Max(0, bestTarget.CalculateShield(attack) - attack.Pierce);
-            bool targetLikelyDies = attack.Strength - targetShield >= bestTarget.Health;
             float exposure = 0f;
             foreach (CActor hostile in hostiles)
             {
-                if (hostile == bestTarget && targetLikelyDies)
+                if (projectedKills.Contains(hostile))
                 {
                     continue;
                 }
@@ -1029,19 +1423,20 @@ namespace GloomhavenPartyAI
             {
                 exposure *= 1.5f;
             }
-            return ScoreAttackTarget(actor, bestTarget, attack) - exposure;
+            return attackValue - exposure;
         }
 
         private static int EffectiveAttackRange(CActor actor, CAbilityAttack attack)
         {
-            if (attack == null)
+            if (actor == null || attack == null)
             {
                 return 1;
             }
             int bonus = CActiveBonus.FindApplicableActiveBonuses(actor, CAbility.EAbilityType.AddRange)
-                .Where(activeBonus => activeBonus.Ability.Augment == null)
+                .Where(activeBonus => activeBonus != null && activeBonus.Ability != null &&
+                    activeBonus.Ability.Augment == null)
                 .Sum(activeBonus => activeBonus.ReferenceStrength(attack, null));
-            return Math.Max(1, attack.Range + bonus);
+            return Math.Max(1, EnhancedValue(attack, attack.Range, EEnhancement.PlusRange) + bonus);
         }
 
         private static bool IsValidTarget(CPlayerActor actor, CActor target, CAbility ability)
@@ -1081,18 +1476,6 @@ namespace GloomhavenPartyAI
         {
             return ScenarioManager.GetTileDistance(first.ArrayIndex.X, first.ArrayIndex.Y,
                 second.ArrayIndex.X, second.ArrayIndex.Y);
-        }
-
-        private static bool HasLineOfSight(CActor first, CActor second)
-        {
-            CTile firstTile = ScenarioManager.Tiles[first.ArrayIndex.X, first.ArrayIndex.Y];
-            CTile secondTile = ScenarioManager.Tiles[second.ArrayIndex.X, second.ArrayIndex.Y];
-            return firstTile != null && secondTile != null && CActor.HaveLOS(firstTile, secondTile);
-        }
-
-        private static float ThreatValue(CActor actor)
-        {
-            return Math.Min(8f, actor.MaxHealth * 0.3f) + (actor.ActorActionHasHappened ? 0f : 5f);
         }
 
         private static int ComparePair(CAbilityCard first, CAbilityCard second,
