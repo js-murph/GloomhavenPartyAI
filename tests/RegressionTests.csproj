@@ -11,6 +11,8 @@
     <Compile Include="*.cs" />
     <Compile Include="../TacticalEvaluation.cs" Link="TacticalEvaluation.cs" />
     <Compile Include="../ItemEvaluation.cs" Link="ItemEvaluation.cs" />
+    <Compile Include="../RecoveryEvaluation.cs" Link="RecoveryEvaluation.cs" />
+    <Compile Include="../SurvivalEvaluation.cs" Link="SurvivalEvaluation.cs" />
     <Compile Include="../DiagnosticJson.cs" Link="DiagnosticJson.cs" />
   </ItemGroup>
 </Project>

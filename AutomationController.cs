@@ -99,6 +99,7 @@ namespace GloomhavenPartyAI
                 _generation++;
             }
             TacticalPlanner.Reset();
+            ShortRestPlanner.Reset();
         }
 
         internal static bool IsAutomated(CActor actor)
@@ -348,7 +349,7 @@ namespace GloomhavenPartyAI
         private static void Schedule(CPlayerActor actor, IEnumerator routine,
             bool waitForQueue = true)
         {
-            if (!IsScenarioReady() || !IsAutomated(actor)) return;
+            if (!IsScenarioReady() || !IsAutomated(actor) || ShortRestPlanner.IsPendingAny) return;
             DecisionKey key;
             int generation;
             int actorEpoch;
@@ -397,6 +398,8 @@ namespace GloomhavenPartyAI
                 return new PromptStamp { Token = GameState.CurrentDamageData, State = "damage" };
             }
             CCharacterClass cards = actor.CharacterClass;
+            if (ShortRestPlanner.IsPending(actor))
+                return new PromptStamp { Token = actor, State = "short-rest:" + ShortRestPlanner.Status };
             if (PhaseManager.PhaseType == CPhase.PhaseType.SelectAbilityCardsOrLongRest)
             {
                 return new PromptStamp { Token = PhaseManager.CurrentPhase, State = "cards:" + cards.LongRest + ":" +
@@ -425,6 +428,10 @@ namespace GloomhavenPartyAI
             else if (ability is CAbilityHeal heal && heal.CanReceiveTileSelection())
                 state = "heal:" + heal.IsWaitingForSingleTargetItemOrActiveBonus() + ":" +
                     string.Join(",", heal.ActorsToTarget.Select(a => a.ActorGuid).ToArray());
+            else if (ability is CAbilityRecoverLostCards recovery && recovery.CanReceiveTileSelection())
+                state = "recover:" + recovery.IsWaitingForSingleTargetItemOrActiveBonus() + ":" +
+                    actor.CharacterClass.LostAbilityCards.Count + ":" +
+                    string.Join(",", recovery.ActorsToTarget.Select(a => a.ActorGuid).ToArray());
             else if (ability != null && ability.CanReceiveTileSelection()) state = "unsupported";
             else return null;
             return new PromptStamp { Token = ability, State = state };
@@ -485,7 +492,31 @@ namespace GloomhavenPartyAI
         // Main-thread polling at about 0.5 seconds; never manufactures a prompt or drains commands.
         internal static void Reconcile()
         {
-            if (!CanAutomate() || !IsScenarioReady()) return;
+            if (!IsScenarioReady()) return;
+            // Short-rest popups use shared UI. Finish only the helper's owned operation and
+            // let a manually completed rest release its lock even if automation was switched off.
+            if (ShortRestPlanner.IsPendingAny)
+            {
+                CPlayerActor owner = ShortRestPlanner.Owner;
+                try
+                {
+                    ShortRestPlanner.TryContinue(owner);
+                    if (ShortRestPlanner.Status == "manual") Handoff(owner, "short_rest_unavailable");
+                    else if (!ShortRestPlanner.IsPendingAny)
+                    {
+                        ClearPromptState(owner);
+                        TacticalPlanner.InvalidatePlan(owner);
+                    }
+                }
+                catch (Exception exception)
+                {
+                    Plugin.Log.LogError("Party AI short-rest decision failed: " + exception);
+                    Record("failure", owner, "reason=exception");
+                    Handoff(owner, "exception");
+                }
+                return;
+            }
+            if (!CanAutomate()) return;
             foreach (CPlayerActor actor in ScenarioManager.Scenario?.PlayerActors.ToList() ?? new List<CPlayerActor>())
             {
                 try
@@ -584,6 +615,11 @@ namespace GloomhavenPartyAI
                     Schedule(actor, ContinueHeal(actor, heal));
                     return;
                 }
+                if (ability is CAbilityRecoverLostCards recovery && recovery.CanReceiveTileSelection())
+                {
+                    Schedule(actor, ContinueRecovery(actor, recovery));
+                    return;
+                }
                 if (GetPrompt(actor, false) != null) Handoff(actor, "unsupported");
             }
         }
@@ -600,6 +636,9 @@ namespace GloomhavenPartyAI
                 Record("decision", actor, key.Damage ? "action=damage" : "reason=best_score");
                 while (DecisionIsCurrent(key, generation, actorEpoch, actor))
                 {
+                    // A short-rest UI operation owns the global dialog, including while other
+                    // actors' previously scheduled card-selection workers were waiting.
+                    if (ShortRestPlanner.IsPendingAny) yield break;
                     if (Time.realtimeSinceStartup >= deadline)
                     {
                         // Stop only our iterator. Never undo/cancel a command already in the rule queue,
@@ -747,6 +786,36 @@ namespace GloomhavenPartyAI
                 character.SetSubInitiativeAbilityCard(null);
                 if (character.RoundAbilityCards.Count == 0 && character.DiscardedAbilityCards.Count >= 2)
                 {
+                    if (Plugin.AutomateShortRests.Value && TacticalPlanner.IsUnderThreat(actor))
+                    {
+                        if ((long)character.HandAbilityCards.Count + character.DiscardedAbilityCards.Count - 1 < 2)
+                        {
+                            Handoff(actor, "no_cards");
+                            yield break;
+                        }
+                        if (character.ImprovedShortRest)
+                        {
+                            Handoff(actor, "unsupported");
+                            yield break;
+                        }
+                        float deadline = Time.realtimeSinceStartup + UiTimeoutSeconds;
+                        while (!ShortRestPlanner.TryStart(actor))
+                        {
+                            if (Time.realtimeSinceStartup >= deadline)
+                            {
+                                Handoff(actor, "short_rest_unavailable");
+                                yield break;
+                            }
+                            yield return null;
+                            if (PhaseManager.PhaseType != CPhase.PhaseType.SelectAbilityCardsOrLongRest ||
+                                character.RoundAbilityCards.Count != 0 || character.HandAbilityCards.Count >= 2)
+                                yield break;
+                        }
+                        Record("rest", actor, "action=rest;reason=under_threat");
+                        Decision(Describe(actor) + " starts a short rest rather than waiting under enemy threat.");
+                        if (ShortRestPlanner.Status == "manual") Handoff(actor, "short_rest_unavailable");
+                        yield break;
+                    }
                     character.LongRest = true;
                     actor.IsLongRestSelected = true;
                     Decision(Describe(actor) + " selected a long rest.");
@@ -1049,6 +1118,12 @@ namespace GloomhavenPartyAI
             CAbilityHeal heal = message?.m_TargetingAbility as CAbilityHeal;
             CPlayerActor actor = message?.m_ActorSpawningMessage as CPlayerActor;
             if (message?.m_TargetingAbility == null || !IsCurrentAbility(message.m_TargetingAbility)) return;
+            if (actor != null && message.m_IsPositive && IsAutomated(actor) &&
+                message.m_TargetingAbility is CAbilityRecoverLostCards recovery && recovery.CanReceiveTileSelection())
+            {
+                Schedule(actor, ContinueRecovery(actor, recovery));
+                return;
+            }
             if (actor != null && message.m_IsPositive && heal != null &&
                 IsAutomated(actor) && heal.CanReceiveTileSelection())
             {
@@ -1135,6 +1210,46 @@ namespace GloomhavenPartyAI
             else
             {
                 Handoff(actor, "unsupported");
+            }
+        }
+
+        private static IEnumerator ContinueRecovery(CPlayerActor actor, CAbilityRecoverLostCards recovery)
+        {
+            if (GameState.InternalCurrentActor != actor || !IsCurrentAbility(recovery) ||
+                !recovery.CanReceiveTileSelection()) yield break;
+            if (!RecoveryPlanner.IsSupported(recovery) || recovery.TargetingActor != actor ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Stun) ||
+                actor.Tokens.HasKey(CCondition.ENegativeCondition.Sleep) ||
+                recovery.IsWaitingForSingleTargetItemOrActiveBonus())
+            {
+                Handoff(actor, "unsupported");
+                yield break;
+            }
+            int recoverable = RecoveryPlanner.RecoverableCount(actor, recovery);
+            if (recoverable == 0)
+            {
+                if (recovery.CanSkip)
+                {
+                    ScenarioRuleClient.Pass();
+                    Record("action_selection", actor, "action=skip;reason=no_recoverable_cards");
+                }
+                else Handoff(actor, "no_recoverable_cards");
+                yield break;
+            }
+            // Self is preselected by the targeting state machine. Selecting its tile again would
+            // deselect it. Normal confirmation owns both recovery and the source card's final pile.
+            if (recovery.ActorsToTarget.Count != 1 || recovery.ActorsToTarget[0] != actor ||
+                !recovery.ValidActorsInRange.Contains(actor) || !recovery.EnoughTargetsSelected())
+            {
+                Handoff(actor, "invalid_state");
+                yield break;
+            }
+            if (ScenarioRuleClient.StepComplete() == 0) Handoff(actor, "invalid_state");
+            else
+            {
+                TacticalPlanner.InvalidatePlan(actor);
+                Record("recovery_submitted", actor, "action=recover;cards=" + recoverable);
+                Decision(Describe(actor) + " confirms recovery of " + recoverable + " lost cards.");
             }
         }
 

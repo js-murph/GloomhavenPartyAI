@@ -29,7 +29,8 @@ namespace GloomhavenPartyAI
             "damage_notifications", "explicit_damage_total", "explicit_damage_samples",
             "heal_amount_reported_total", "death_notifications", "exhausted_player_notifications",
             "invalid_action_notifications", "undo_notifications", "restart_round_notifications",
-            "capture_errors", "records_dropped", "items_submitted"
+            "capture_errors", "records_dropped", "items_submitted", "recoveries_submitted",
+            "recoveries_observed", "cards_recovered", "short_rests_observed"
         };
         private static readonly long[] Counters = new long[CounterNames.Length];
         private static ConfigEntry<bool> _mode;
@@ -123,9 +124,10 @@ namespace GloomhavenPartyAI
                         case "heal_submitted": Counters[4]++; break;
                         case "move_submitted": Counters[5]++; break;
                         case "item_submitted": Counters[20]++; break;
+                        case "recovery_submitted": Counters[21]++; break;
                         case "item_candidate": case "item_evaluation": case "item_confirmed":
                         case "pair_candidate": case "action_candidate": case "target_candidate":
-                        case "move_candidate":
+                        case "move_candidate": case "retreat_candidate": case "door_decision":
                         case "toggle": case "snapshot": break;
                         default: kind = "other"; break;
                     }
@@ -152,6 +154,23 @@ namespace GloomhavenPartyAI
                     string kind;
                     switch (message.m_Type)
                     {
+                        case CMessageData.MessageType.RecoverLostCards:
+                            kind = "recovery_observed";
+                            if (message is CRecoverLostCards_MessageData recovered &&
+                                recovered.m_ActorRecoveringLostCards is CPlayerActor recovering &&
+                                recovered.m_Ability is CAbilityRecoverLostCards recovery)
+                            {
+                                actor = recovering;
+                                amount = Math.Max(0, recovery.StartLostCards - recovering.CharacterClass.LostAbilityCards.Count);
+                                Counters[22]++;
+                                Counters[23] += amount.Value;
+                            }
+                            break;
+                        case CMessageData.MessageType.PlayerShortRested:
+                            kind = "short_rest_observed";
+                            actor = (message as CPlayerShortRested_MessageData)?.m_Player ?? actor;
+                            Counters[24]++;
+                            break;
                         case CMessageData.MessageType.ActorHasAttacked:
                             kind = "attack_observed";
                             Counters[6]++;
@@ -513,13 +532,14 @@ namespace GloomhavenPartyAI
                     case "item_id": case "message_id": case "path_cost": case "movement":
                     case "bonus": case "target_id": case "first_card_id": case "second_card_id":
                     case "default_action": case "top": case "bottom": case "first":
+                    case "threats": case "future_damage":
                         if (!data.TryAddNumber(key, value)) redacted = true;
                         break;
                     case "action":
                         switch (value)
                         {
                             case "attack": case "heal": case "move": case "rest": case "cards":
-                            case "damage": case "skip": case "toggle": case "item": data.Add(key, value); break;
+                            case "damage": case "skip": case "toggle": case "item": case "recover": data.Add(key, value); break;
                             default: redacted = true; break;
                         }
                         break;
@@ -532,6 +552,9 @@ namespace GloomhavenPartyAI
                             case "fallback": case "lethal": case "nonlethal": case "no_cards":
                             case "invalid_state": case "no_action": case "door": case "user_toggle":
                             case "unavailable": case "unhelpful": case "supported": case "ui_not_ready":
+                            case "retreat": case "party_not_ready": case "door_ready": case "exposure":
+                            case "under_threat": case "short_rest": case "redraw":
+                            case "short_rest_unavailable": case "no_recoverable_cards":
                                 data.Add(key, value); break;
                             default: redacted = true; break;
                         }

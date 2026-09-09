@@ -1,6 +1,6 @@
 # Developing Party AI
 
-The v0.4.0 development build addresses baseline tactical mistakes and adds evidence collection. It is not a claim that the AI can complete arbitrary scenarios or play every class well. Actual game testing remains with the user; the work below was built and checked without launching Gloomhaven or changing its installed plugin.
+The v0.5.0 development build focuses on recovery and survival mistakes identified in a failed Black Barrow run. It includes the v0.4.0 tactical corrections, diagnostics, and initial item support. It is not a claim that the AI can complete arbitrary scenarios or play every class well. Automated checks do not launch Gloomhaven; actual scenario testing remains with the user.
 
 ## Development Stages
 
@@ -8,12 +8,19 @@ These stages organize the requested improvements. Later version numbers are prop
 
 | Stage | Status | Work |
 | --- | --- | --- |
-| v0.4.0: baseline and diagnostics | Implemented in development source; runtime validation pending | Prompt serialization/recovery, visible handoffs, full printed/default alternatives, attack scoring corrections, safer repositioning, card-retention heuristics, structured captures, initial healing/attack/movement items, pure regression checks. |
-| v0.5.x: survival and endurance | Follow-up | Short-rest decisions, defensive items before card loss, recovery/stamina choices, revealed monster-action threat estimates, retaliation, modifier-deck kill probabilities, and longer-horizon card/room budgeting. |
+| v0.4.0: baseline and diagnostics | Merged; targeted runtime validation pending | Prompt serialization/recovery, visible handoffs, full printed/default alternatives, attack scoring corrections, safer repositioning, card-retention heuristics, structured captures, initial healing/attack/movement items, pure regression checks. |
+| v0.5.0: recovery and survival | Implemented in development source; runtime validation pending | Reviving Ether recovery and retention, retreat/support movement, bounded approach risk, door readiness, visible monster-intent estimates, ordinary short rests under threat, and synthetic game-reference tests. |
+| Further endurance work | Follow-up | Defensive items before card loss, recovery/stamina item choices, retaliation, modifier-deck kill probabilities, improved short rests, and longer-horizon card/room budgeting. |
 | v0.6.x: class and party play | Follow-up | A tested capability matrix for selected classes/loadouts, multi-target/area attacks, essential persistent effects and elements, shared destination/target intentions, coordinated rests and door opening. |
 | Later: scenario coverage | Follow-up | Explicit exit, escort, interaction, and scenario-objective handling; broader class mechanics and repeatable scenario benchmarks. |
 
-The first build still uses heuristic scores. It does not simulate cumulative nonlethal damage across attacks, compose a full route across successive moves, or forecast every condition and item interaction. Route validation deliberately rejects some risky paths instead of estimating whether their cost is worthwhile. Card-retention scoring cannot yet protect class engines it does not understand.
+The planner still uses heuristic scores. It does not simulate cumulative nonlethal damage across attacks, compose a full route across successive moves, or forecast every condition and item interaction. Route validation deliberately rejects some risky paths instead of estimating whether their cost is worthwhile. Threat estimates do not fully simulate monster focus, pathfinding, shields, retaliation, or modifier draws. Card-retention scoring cannot protect every class engine it does not understand.
+
+### Failure Cases Addressed
+
+The analysed run loaded v0.3.2, not v0.4.0. In round 9, Tinkerer crossed two traps for five damage and opened an eight-enemy room while Spellweaver rested. It remained in the doorway after healing, burned its remaining cards to prevent attacks, and died before its round-11 long rest. The new movement policy considers withdrawal without requiring a follow-up attack and treats door opening as a readiness decision rather than spare movement.
+
+In round 14, Spellweaver selected Reviving Ether and Mana Bolt with three cards already in ordinary Lost, but used Ether as Attack 2 instead of recovering them. It exhausted in round 17. The recovery policy values additional playable turns, preserves the unused recovery card, and admits the actual printed recovery action with its fixed Dark infusion. It also handles the second-action state, where the companion card has already left the Round pile. Waiting until only two discards remained in round 16 would already have been too late; retaining Ether alone is not a complete fix.
 
 ## Developer Diagnostics
 
@@ -39,8 +46,11 @@ Records contain game identifiers, actor class/GUID, positions, health, card-pile
 | `session_start` | Capture session and version context. Enabling capture partway through a scenario does not reconstruct earlier events. |
 | `pair_candidate`, `action_candidate` | Scores for alternatives considered during card/action selection. Scores are heuristic utilities, not win probabilities. |
 | `target_candidate`, `move_candidate` | Target/position evaluations. Position and actor state help explain which alternatives were available. |
+| `retreat_candidate`, `door_decision` | Retreat/support scores and door-readiness outcomes. `future_damage` is estimated incoming damage; `threats` is the weighted exposure penalty, not a monster count. |
 | `card_selection`, `action_selection`, `rest`, `damage_response` | Choices made by the controller. |
 | `attack_submitted`, `heal_submitted`, `move_submitted` | A command was submitted. This does not prove it executed or helped. |
+| `recovery_submitted`, `recovery_observed` | Recovery confirmation versus the game's recovery notification. The observed recovered-card count comes from the ability's starting Lost count and the remaining Lost pile. |
+| `rest`, `short_rest_observed` | Rest intent or confirmation versus the game's completed short-rest notification. `redraw` records the normal one-HP redraw choice; it is not a planner-chosen loss. |
 | `item_candidate`, `item_evaluation`, `item_submitted`, `item_confirmed` | Item eligibility/scoring, an activation submission, or confirmation of the resulting supported item heal. Submission is not evidence that the item was consumed successfully. |
 | `attack_observed`, `heal_observed`, `move_observed`, damage/target notifications | Game notifications, separate from submissions. Use the actor/target snapshots and round context to interpret effects. |
 | `handoff`, `failure`, `invalid_action_observed` | Unsupported input, controller failure, or a game-reported invalid action. Handoffs explain `AI WAIT`. |
@@ -62,7 +72,7 @@ No completion-rate target has been established yet. The first goal is to collect
 
 These are user-run checks, not tests already performed. Use the development DLL at `bin/Release/net472/GloomhavenPartyAI.dll`, not the unchanged tracked release artifact. The existing README smoke-test checklist still applies.
 
-1. Enable developer mode in a disposable offline scenario. Confirm JSONL records include v0.4.0, candidate scores, actor state, and round context. Disable it and confirm capture stops. Verify online play creates no capture.
+1. Enable developer mode in a disposable offline scenario. Confirm the startup log and JSONL records include v0.5.0, candidate scores, actor state, and round context. Disable it and confirm capture stops. Verify online play creates no capture.
 2. Toggle automation off while cards are being selected, then back on after the queued move finishes. Confirm exactly two cards and a usable initiative selection. Repeat with one manually selected card and an otherwise empty hand.
 3. Keep a card preview open long enough to delay the bot, then close it. Confirm automation can resume. Exercise a mandatory bonus choice, resolve it manually, and check whether `AI WAIT` clears. Record any case that requires a toggle to recover.
 4. Exercise a multi-target heal and check that selected targets are not toggled off by duplicate processing. Trigger a damage prompt during another pending decision, including lethal damage with one hand card or two discarded cards available.
@@ -72,11 +82,17 @@ These are user-run checks, not tests already performed. Use the development DLL 
 8. Test boots when their bonus exactly enables a useful attack and when the attack is already reachable. Check that useful boots activate once, unneeded boots remain available, and the follow-up attack guidance survives activation.
 9. Test an attack boost at a useful damage/kill breakpoint and against a shield that absorbs the entire boosted attack. Test goggles with and without existing advantage. Check item state, target choice, and completion of the attack.
 10. Complete, lose, and abandon separate scenarios. Check explicit outcome records and summaries. Reload a scenario and confirm no decisions or plans from the previous run carry over.
+11. Give Spellweaver three ordinary lost cards and a playable Ether/Mana Bolt pair. Check that recovery competes with the basic attack, returns only ordinary Lost cards, and allows the companion heal. Repeat with Ether as the second action, no hand cards, and at least two lost cards. Empty Lost should not spend Ether's top; its bottom remains normal Move 4/Jump.
+12. After a heal or attack, leave a low-HP actor beside two enemies with movement available. Check for a safer retreat. Separately, a healthy melee actor outside a stationary ranged enemy's range should approach over successive moves rather than wait forever.
+13. Approach a closed door while an ally rests or is too far behind. Confirm the bot stages before it, then can open once the party is ready and the opener has an attack left. Check the actual route for traps, not only its endpoint.
+14. Run out of hand cards under threat with at least three discarded cards. Verify a normal random-loss short rest, one redraw only for an unused recovery card when HP permits, and fresh pair selection afterward. Toggle off during the dialog and complete it manually. Test hiding/switching a hand during the loss animation, another actor resting afterward, and unrelated dialogs. The AI should never click an unrelated popup or remain globally blocked by a cancelled animation. Zero hand plus two discards must not start a short rest that leaves no playable pair.
 
 For a failure report, the diagnostic files, the relevant BepInEx log excerpt, the round, the actor class, and a short account of the expected versus actual action are more useful than a score alone. Include a screenshot when position or targeting is involved. Do not include game assemblies or save files in the repository.
 
 ## Verification Boundaries
 
-The durable regression project runs without proprietary dependencies. It tests scoring invariants, copied-action identity matching, movement-rule cache keys, item thresholds, and JSON encoding. CI runs it on .NET 8 and 10. A local game-referenced build checks API compatibility, not live Harmony behavior.
+The dependency-free regression project tests scoring invariants, copied-action identity, movement-rule cache keys, item thresholds, recovery/endurance, survival/door/approach rules, and JSON encoding. CI runs it on .NET 8 and 10.
 
-During development, additional temporary harnesses checked installed item definitions and simulated diagnostic rotation, opt-out, and result handling. Those harnesses are not part of the repository test suite and do not replace runtime checks. The game was not launched, the installed mod was not updated, and no release was published.
+The optional `tests/GameReferenceTests` project reads installed card definitions and links the real planner and recovery policy. Managed fixtures check Ether's Dark infusion, copied abilities, Lost versus Permanently Lost, retention, first/second-action selection, and approach/retreat decisions. These are synthetic board states, not a replay of the failed scenario. The fixture bypasses Unity-dependent rules-container constructors and seeds only the parser's character lookup. The main README includes its command and dependency requirements.
+
+During v0.4.0 development, additional temporary harnesses checked installed item definitions and simulated diagnostic rotation, opt-out, and result handling. Those harnesses are not part of the repository test suite and do not replace runtime checks. Neither automated suite validates live short-rest dialogs, animation timing, recovery execution, or scenario completion. No release tag is implied by a development build or a local test installation.
