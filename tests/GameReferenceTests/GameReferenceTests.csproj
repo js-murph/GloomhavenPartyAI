@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RegressionTargetFramework Condition="'$(RegressionTargetFramework)' == ''">net8.0</RegressionTargetFramework>
+    <TargetFramework>$(RegressionTargetFramework)</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GameRoot Condition="'$(GameRoot)' == ''">$(GLOOMHAVEN_GAME_ROOT)</GameRoot>
+    <ManagedDir>$(GameRoot)/GH_Data/Managed</ManagedDir>
+  </PropertyGroup>
+  <Target Name="ValidateExternalReferences" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="'$(GameRoot)' == ''" Text="Set GameRoot or GLOOMHAVEN_GAME_ROOT to a Gloomhaven installation." />
+    <Error Condition="!Exists('$(ManagedDir)/ScenarioRuleLibrary.dll')" Text="ScenarioRuleLibrary.dll was not found under $(ManagedDir)." />
+    <Error Condition="!Exists('$(ManagedDir)/SharedLibrary.dll')" Text="SharedLibrary.dll was not found under $(ManagedDir)." />
+    <Error Condition="!Exists('$(GameRoot)/Rulebase/Global.ruleset')" Text="Global.ruleset was not found under $(GameRoot)/Rulebase." />
+  </Target>
+  <ItemGroup>
+    <AssemblyMetadata Include="GameRoot" Value="$(GameRoot)" />
+    <Compile Include="../../RecoveryPlanner.cs" Link="RecoveryPlanner.cs" />
+    <Compile Include="../../RecoveryEvaluation.cs" Link="RecoveryEvaluation.cs" />
+    <Compile Include="../../TacticalPlanner.cs" Link="TacticalPlanner.cs" />
+    <Compile Include="../../PlanningBudget.cs" Link="PlanningBudget.cs" />
+    <Compile Include="../../TacticalEvaluation.cs" Link="TacticalEvaluation.cs" />
+    <Compile Include="../../SurvivalEvaluation.cs" Link="SurvivalEvaluation.cs" />
+    <Reference Include="ScenarioRuleLibrary" HintPath="$(ManagedDir)/ScenarioRuleLibrary.dll" Private="false" />
+    <Reference Include="SharedLibrary" HintPath="$(ManagedDir)/SharedLibrary.dll" Private="false" />
+  </ItemGroup>
+</Project>

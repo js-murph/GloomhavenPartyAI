@@ -12,7 +12,7 @@ namespace GloomhavenPartyAI
     {
         public const string Guid = "com.jsm.gloomhaven.partyai";
         public const string Name = "Gloomhaven Party AI";
-        public const string Version = "0.4.0";
+        public const string Version = "0.5.1";
 
         internal static ManualLogSource Log;
         internal static ConfigEntry<bool> ModEnabled;
@@ -22,6 +22,7 @@ namespace GloomhavenPartyAI
         internal static ConfigEntry<float> DecisionDelay;
         internal static ConfigEntry<bool> LogDecisions;
         internal static ConfigEntry<bool> AutomateItems;
+        internal static ConfigEntry<bool> AutomateShortRests;
         internal static ConfigEntry<bool> DeveloperMode;
 
         private Harmony _harmony;
@@ -44,6 +45,8 @@ namespace GloomhavenPartyAI
                 "Write card, rest, action, targeting, and damage decisions to the BepInEx log.");
             AutomateItems = Config.Bind("Decisions", "AutomateItems", true,
                 "Evaluate supported healing, movement, and attack items for automated mercenaries. Complex item choices remain manual.");
+            AutomateShortRests = Config.Bind("Decisions", "AutomateShortRests", true,
+                "Use normal random-loss short rests when an automated mercenary needs cards under threat. Improved short rests remain manual.");
             DeveloperMode = Config.Bind("Diagnostics", "DeveloperMode", false,
                 "Write offline diagnostic JSONL files under BepInEx/PartyAI/diagnostics (up to five 5 MiB files). No uploads. Does not enable automation.");
 
@@ -51,6 +54,8 @@ namespace GloomhavenPartyAI
             DeveloperDiagnostics.Initialize(DeveloperMode, AutomationController.AutomationState);
             _harmony = new Harmony(Guid);
             _harmony.PatchAll(typeof(AutomationPatches));
+            _harmony.PatchAll(typeof(ShortRestPlanner));
+            _harmony.PatchAll(typeof(EndTurnController));
             Logger.LogInfo(Name + " v" + Version + " loaded (offline-only tactical mode).");
         }
 

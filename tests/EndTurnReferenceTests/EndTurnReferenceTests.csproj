@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RegressionTargetFramework Condition="'$(RegressionTargetFramework)' == ''">net8.0</RegressionTargetFramework>
+    <TargetFramework>$(RegressionTargetFramework)</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GameRoot Condition="'$(GameRoot)' == ''">$(GLOOMHAVEN_GAME_ROOT)</GameRoot>
+    <ManagedDir>$(GameRoot)/GH_Data/Managed</ManagedDir>
+    <CoreDir>$(GameRoot)/BepInEx/core</CoreDir>
+  </PropertyGroup>
+  <Target Name="ValidateExternalReferences" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="'$(GameRoot)' == ''" Text="Set GameRoot or GLOOMHAVEN_GAME_ROOT to a Gloomhaven installation with BepInEx." />
+    <Error Condition="!Exists('$(ManagedDir)/GH.Runtime.dll')" Text="GH.Runtime.dll was not found under $(ManagedDir)." />
+    <Error Condition="!Exists('$(ManagedDir)/ScenarioRuleLibrary.dll')" Text="ScenarioRuleLibrary.dll was not found under $(ManagedDir)." />
+    <Error Condition="!Exists('$(CoreDir)/0Harmony.dll')" Text="0Harmony.dll was not found under $(CoreDir)." />
+    <Error Condition="!Exists('$(CoreDir)/Mono.Cecil.dll')" Text="Mono.Cecil.dll was not found under $(CoreDir)." />
+  </Target>
+  <ItemGroup>
+    <AssemblyMetadata Include="GameRoot" Value="$(GameRoot)" />
+    <Compile Include="../../EndTurnController.cs" Link="EndTurnController.cs" />
+    <Reference Include="GH.Runtime" HintPath="$(ManagedDir)/GH.Runtime.dll" Private="false" />
+    <Reference Include="ScenarioRuleLibrary" HintPath="$(ManagedDir)/ScenarioRuleLibrary.dll" Private="false" />
+    <Reference Include="SharedLibrary" HintPath="$(ManagedDir)/SharedLibrary.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(ManagedDir)/UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.UI" HintPath="$(ManagedDir)/UnityEngine.UI.dll" Private="false" />
+    <Reference Include="0Harmony" HintPath="$(CoreDir)/0Harmony.dll" Private="false" />
+    <Reference Include="Mono.Cecil" HintPath="$(CoreDir)/Mono.Cecil.dll" Private="false" />
+  </ItemGroup>
+</Project>
