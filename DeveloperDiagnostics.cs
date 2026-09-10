@@ -48,6 +48,8 @@ namespace GloomhavenPartyAI
         private static bool _explicitResult;
         private static double _retryAfter;
         private static double _warnAfter;
+        private static double _lastFlush;
+        private static long _fileBytes;
         private static ConditionalWeakTable<CMessageData, object> _seen =
             new ConditionalWeakTable<CMessageData, object>();
 
@@ -92,7 +94,7 @@ namespace GloomhavenPartyAI
                 try
                 {
                     _enabled = _mode != null && _mode.Value;
-                    // No final write on opt-out. Every preceding record already contains counters.
+                    // Close flushes already captured records; opt-out does not create a final record.
                     CanCapture();
                 }
                 catch (Exception) { CaptureError(); }
@@ -125,6 +127,8 @@ namespace GloomhavenPartyAI
                         case "move_submitted": Counters[5]++; break;
                         case "item_submitted": Counters[20]++; break;
                         case "recovery_submitted": Counters[21]++; break;
+                        case "end_turn_submitted": Counters[0]++; break;
+                        case "planner_timing": case "short_rest_blocked": break;
                         case "item_candidate": case "item_evaluation": case "item_confirmed":
                         case "pair_candidate": case "action_candidate": case "target_candidate":
                         case "move_candidate": case "retreat_candidate": case "door_decision":
@@ -292,7 +296,15 @@ namespace GloomhavenPartyAI
             {
                 try
                 {
-                    if (CanCapture() && _session != null) ObserveResult();
+                    if (CanCapture() && _session != null)
+                    {
+                        ObserveResult();
+                        if (_stream != null && Clock.Elapsed.TotalSeconds - _lastFlush >= 1)
+                        {
+                            _stream.Flush();
+                            _lastFlush = Clock.Elapsed.TotalSeconds;
+                        }
+                    }
                 }
                 catch (Exception) { CaptureError(); }
             }
@@ -533,13 +545,28 @@ namespace GloomhavenPartyAI
                     case "bonus": case "target_id": case "first_card_id": case "second_card_id":
                     case "default_action": case "top": case "bottom": case "first":
                     case "threats": case "future_damage":
+                    case "path_queries": case "los_queries": case "candidate_samples": case "cache_hits":
+                    case "budget_exhausted": case "time_budget_exceeded":
+                    case "actor_id": case "blocking_actor_id": case "current_actor_id": case "target_actor_id":
+                    case "active_actor_id": case "mode": case "queue": case "modal": case "ui_preview":
+                    case "deck_preview": case "full_preview": case "ui_locks": case "current_mode":
+                    case "target_hand_id": case "target_mode": case "target_rested": case "target_ui_rested":
+                    case "target_animation": case "target_ui_animation": case "target_draw": case "target_alternate_draw":
+                    case "target_draw_card": case "target_preview": case "target_visible": case "target_interactable":
+                    case "target_selected": case "target_rest_selected": case "target_rest_visible":
+                    case "target_rest_interactable": case "target_rest_actor_id": case "target_confirmation": case "target_showing":
+                    case "blocking_hand_id": case "blocking_mode": case "blocking_rested": case "blocking_ui_rested":
+                    case "blocking_animation": case "blocking_ui_animation": case "blocking_draw": case "blocking_alternate_draw":
+                    case "blocking_draw_card": case "blocking_preview":
                         if (!data.TryAddNumber(key, value)) redacted = true;
                         break;
                     case "action":
                         switch (value)
                         {
                             case "attack": case "heal": case "move": case "rest": case "cards":
-                            case "damage": case "skip": case "toggle": case "item": case "recover": data.Add(key, value); break;
+                            case "damage": case "skip": case "toggle": case "item": case "recover":
+                            case "action": case "initiative": case "boots": case "end_turn":
+                            case "threat": case "card_loss": data.Add(key, value); break;
                             default: redacted = true; break;
                         }
                         break;
@@ -555,6 +582,9 @@ namespace GloomhavenPartyAI
                             case "retreat": case "party_not_ready": case "door_ready": case "exposure":
                             case "under_threat": case "short_rest": case "redraw":
                             case "short_rest_unavailable": case "no_recoverable_cards":
+                            case "rest_capability": case "rest_queue": case "rest_modal": case "rest_preview":
+                            case "rest_other_hand_busy": case "rest_target_hand": case "rest_card_views":
+                            case "rest_rules": case "rest_ready":
                                 data.Add(key, value); break;
                             default: redacted = true; break;
                         }
@@ -603,7 +633,12 @@ namespace GloomhavenPartyAI
                 record.Add("round", ScenarioManager.CurrentScenarioState.RoundNumber);
             else record.Add("round", (string)null);
             record.Add("scenario_level", _scenario.Level);
-            record.Add("actor", Snapshot(actor)).Add("data", data).Add("counters", counters);
+            // Candidate loops need identity and scores, not repeated full inventory/token snapshots.
+            bool candidate = kind.EndsWith("_candidate", StringComparison.Ordinal) || kind == "item_evaluation";
+            var actorData = candidate && actor != null
+                ? new DiagnosticJson().Add("guid", Limit(actor.ActorGuid)).Add("class", Limit(actor.Class?.ID))
+                : Snapshot(actor);
+            record.Add("actor", actorData).Add("data", data).Add("counters", counters);
             byte[] bytes = Utf8.GetBytes(record + "\n");
             if (bytes.Length > MaxLineBytes) { Counters[19]++; return; }
             if (!CanCapture() || _session == null) return;
@@ -613,10 +648,14 @@ namespace GloomhavenPartyAI
                 Directory.CreateDirectory(_directory);
                 Rotate();
             }
-            else if (_stream.Length + bytes.Length > MaxFileBytes) Rotate();
+            else if (_fileBytes + bytes.Length > MaxFileBytes) Rotate();
             _stream.Write(bytes, 0, bytes.Length);
-            // No buffered JSON remains to be flushed after the user disables capture.
-            _stream.Flush();
+            _fileBytes += bytes.Length;
+            if (kind == "failure" || kind == "handoff" || kind == "game_failure_observed" || kind == "session_end")
+            {
+                _stream.Flush();
+                _lastFlush = Clock.Elapsed.TotalSeconds;
+            }
         }
 
         private static string FilePath(int index)
@@ -631,7 +670,10 @@ namespace GloomhavenPartyAI
             File.Delete(FilePath(MaxFiles - 1));
             for (int i = MaxFiles - 2; i >= 0; i--)
                 if (File.Exists(FilePath(i))) File.Move(FilePath(i), FilePath(i + 1));
-            _stream = new FileStream(FilePath(0), FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+            _stream = new FileStream(FilePath(0), FileMode.CreateNew, FileAccess.Write, FileShare.Read,
+                64 * 1024, FileOptions.SequentialScan);
+            _fileBytes = 0;
+            _lastFlush = Clock.Elapsed.TotalSeconds;
         }
 
         private static void CaptureError()

@@ -12,7 +12,7 @@ namespace GloomhavenPartyAI
     {
         public const string Guid = "com.jsm.gloomhaven.partyai";
         public const string Name = "Gloomhaven Party AI";
-        public const string Version = "0.5.0";
+        public const string Version = "0.5.1";
 
         internal static ManualLogSource Log;
         internal static ConfigEntry<bool> ModEnabled;
@@ -55,6 +55,7 @@ namespace GloomhavenPartyAI
             _harmony = new Harmony(Guid);
             _harmony.PatchAll(typeof(AutomationPatches));
             _harmony.PatchAll(typeof(ShortRestPlanner));
+            _harmony.PatchAll(typeof(EndTurnController));
             Logger.LogInfo(Name + " v" + Version + " loaded (offline-only tactical mode).");
         }
 

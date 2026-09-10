@@ -66,7 +66,7 @@ namespace GloomhavenPartyAI
             bool waiting = automated && AutomationController.NeedsInput(actor);
             Image image = control.GetComponent<Image>();
             image.color = waiting ? WaitingColor : automated ? AutomatedColor : ManualColor;
-            label.text = waiting ? "AI WAIT" : automated ? "AI ON" : "AI OFF";
+            label.text = waiting ? "AI HELP" : automated ? "AI ON" : "AI OFF";
             label.color = automated ? Color.white : new Color(0.88f, 0.82f, 0.7f, 1f);
             button.interactable = AutomationController.CanToggleAutomation() && !actor.IsDead;
 

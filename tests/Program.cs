@@ -4,6 +4,15 @@ internal static class Program
     {
         Action[] tests =
         [
+            DecisionClockTests.OneActorsThirtySevenSecondPlanDoesNotExpireAnotherActorsUiDeadline,
+            DecisionClockTests.UiAndQueueWaitingStillAdvanceBetweenPlanningCalls,
+            DecisionClockTests.ResetDiscardsPriorScenarioExclusions,
+            DecisionClockTests.InvalidAndOverflowingDurationsDoNotCorruptTheClock,
+            PlanningBudgetTests.RequestedLimitsCannotRaiseHardCaps,
+            PlanningBudgetTests.LowerAndNegativeLimitsAreIndependent,
+            PlanningBudgetTests.InjectedClockEnforcesFiftyMillisecondStickyDeadline,
+            PlanningBudgetTests.DeadlineAfterOneCallStopsEveryCategory,
+            PlanningBudgetTests.ImmediateDeadlinesAndCacheHitsDoNotAdmitQueries,
             TacticalTests.CopiedActionIdentityPreservesOnlyTheCommittedHalf,
             TacticalTests.MovementCacheKeysDistinguishEveryRuleCombination,
             TacticalTests.ZeroDamageAndDeadTargetsHaveNoAttackValue,

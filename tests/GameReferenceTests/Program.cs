@@ -24,7 +24,7 @@ internal static class Program
     }
 }
 
-internal static class ReferenceTests
+internal static partial class ReferenceTests
 {
     private static string gameRoot;
     private static AbilityCardYMLData ether;
@@ -54,7 +54,22 @@ internal static class ReferenceTests
             SecondActionRecoveryUsesCurrentActorAndPhaseOnly,
             LastPairChooseNextActionRecoversAfterCompanionDiscard,
             MoveDestinationAdvancesAtLimitedRiskButProtectsLowHealth,
-            MoveDestinationRequiresAnAttackAndAnUnblockedRoute
+            MoveDestinationRequiresAnAttackAndAnUnblockedRoute,
+            EightCardPreselectionUsesNoPathOrLos,
+            TwelveCardPreselectionUsesNoPathOrLos,
+            ExpiredPreselectionPreservesRecoveryPairAndPartner,
+            FourRefinedPlansShareOperationBudgets,
+            ZeroBudgetRecoveryFallbackPreservesLastChance,
+            DeadlineAfterOneEngineCallStopsMovement,
+            PathCacheReusesQueriesButCannotBypassDeadline,
+            SameMoveContinuesToFirstEndpointAndStopsOnArrival,
+            BlockedCorridorCannotOscillateOrRevisitAndInvalidationResets,
+            AttackRankingScoresOnlyUniqueSuppliedTargetsAndBreaksTiesStably,
+            HealRankingScoresOnlyUsefulSuppliedAlliesAndBreaksTiesStably,
+            TargetRankingsRespectHardAndSharedCandidateCaps,
+            ColdExpiredRankingsDoNotEnumerateOrQueryTheEngine,
+            ThreatQueriesShareLosBudgetAndExpiredThreatIsConservative,
+            PlannerOperationMeasurements
         ];
         int failures = 0;
         int passed = 0;
@@ -310,7 +325,7 @@ internal static class ReferenceTests
     }
 
     private static void WithBoard(Action<CPlayerActor, CEnemyActor, CAbilityCard, CAbilityCard> test,
-        bool rangedEnemy = false, bool blockMovement = true)
+        bool rangedEnemy = false, bool blockMovement = true, bool tinyCorridor = false)
     {
         // This is a managed snapshot, not a replay of R14's room. The synthetic partner supplies
         // ordinary Attack 2 / Move 2; Ether's printed halves are parsed from the installed rules.
@@ -321,7 +336,7 @@ internal static class ReferenceTests
         actor.Health = actor.MaxHealth = 10;
         actor.TakingExtraTurnOfTypeStack = new();
         typeof(CActor).GetProperty("ActorGuid").SetValue(actor, "r14-reference-player");
-        SetField(typeof(CActor), actor, "m_ArrayIndex", new Point(2, 2));
+        SetField(typeof(CActor), actor, "m_ArrayIndex", tinyCorridor ? new Point(4, 17) : new Point(2, 2));
         SetField(typeof(CActor), actor, "m_Tokens", new CTokens(actor));
         SetField(typeof(CCharacterClass), actor.CharacterClass, "m_ActivatedCards", new List<CBaseCard>());
         SetField(typeof(CCharacterClass), actor.CharacterClass, "m_CharacterYML",
@@ -336,7 +351,7 @@ internal static class ReferenceTests
             Health = 6, MaxHealth = 6, CauseOfDeath = CActor.ECauseOfDeath.StillAlive };
         typeof(CActor).GetProperty("ActorGuid").SetValue(enemy, "r14-reference-target");
         SetField(typeof(CActor), enemy, "m_Class", monster);
-        SetField(typeof(CActor), enemy, "m_ArrayIndex", new Point(rangedEnemy ? 7 : 3, 2));
+        SetField(typeof(CActor), enemy, "m_ArrayIndex", tinyCorridor ? new Point(9, 17) : new Point(rangedEnemy ? 7 : 3, 2));
         SetField(typeof(CActor), enemy, "m_Tokens", new CTokens(enemy));
 
         var scenario = new CScenario("reference", "reference", 1, default, null);
@@ -351,14 +366,18 @@ internal static class ReferenceTests
             property.SetValue(state, Activator.CreateInstance(property.PropertyType));
         }
         var map = new CMap { Revealed = true };
-        var tiles = new CTile[10, 5];
-        var paths = new CPathFinder(10, 5, true);
-        for (int x = 0; x < 10; x++)
-        for (int y = 0; y < 5; y++)
+        // Pad the seven usable corridor hexes: engine corner-to-corner LOS needs neighboring tiles.
+        int width = tinyCorridor ? 12 : 10;
+        int height = tinyCorridor ? 20 : 5;
+        var tiles = new CTile[width, height];
+        var paths = new CPathFinder(width, height, true);
+        for (int x = 0; x < width; x++)
+        for (int y = 0; y < height; y++)
         {
             tiles[x, y] = new CTile { m_ArrayIndex = new Point(x, y), m_HexMap = map };
             paths.Nodes[x, y].Walkable = true;
-            paths.Nodes[x, y].Blocked = blockMovement && new Point(x, y) != actor.ArrayIndex && new Point(x, y) != enemy.ArrayIndex;
+            paths.Nodes[x, y].Blocked = tinyCorridor && (y != 17 || x < 3 || x > 9) ||
+                blockMovement && new Point(x, y) != actor.ArrayIndex && new Point(x, y) != enemy.ArrayIndex;
         }
         var savedFields = new Dictionary<FieldInfo, object>();
         ScenarioState savedState = ScenarioManager.CurrentScenarioState;
@@ -368,8 +387,8 @@ internal static class ReferenceTests
         {
             foreach (var (type, name, value) in new (Type, string, object)[]
                 { (typeof(ScenarioManager), "s_Scenario", scenario), (typeof(ScenarioManager), "s_TileArray", tiles),
-                  (typeof(ScenarioManager), "s_PathFinder", paths), (typeof(ScenarioManager), "s_Width", 10),
-                  (typeof(ScenarioManager), "s_Height", 5), (typeof(GameState), "s_CurrentActor", actor),
+                  (typeof(ScenarioManager), "s_PathFinder", paths), (typeof(ScenarioManager), "s_Width", width),
+                  (typeof(ScenarioManager), "s_Height", height), (typeof(GameState), "s_CurrentActor", actor),
                   (typeof(GameState), "s_CurrentActionSelectionFlag", GameState.EActionSelectionFlag.None),
                   (typeof(GameState), "<RoundAbilityCardselected>k__BackingField", null),
                   (typeof(PhaseManager), "s_CurrentPhase", null) })
@@ -554,17 +573,17 @@ internal static class ReferenceTests
             Require(DistanceToEnemy(start, enemy) == 5 && enemy.MonsterClass.Move == 0 &&
                 enemy.MonsterClass.Attack == 2 && enemy.MonsterClass.Range == 3,
                 "Move 2 melee starts five hexes from a stationary ranged Attack 2 / Range 3 enemy");
-            CTile healthy = TacticalPlanner.ChooseMoveDestination(actor, move);
+            CTile healthy = TacticalPlanner.ChooseMoveDestination(actor, move, FrozenBudget());
             Require(healthy != null && healthy != start && DistanceToEnemy(healthy, enemy) == 3,
                 "healthy destination selection must advance two hexes, not stall outside the ranged enemy");
             Require(TacticalPlanner.ThreatAt(actor, healthy.m_ArrayIndex) > TacticalPlanner.ThreatAt(actor, start.m_ArrayIndex),
                 "the demonstrated progress tolerates limited extra exposure, not merely an equally safe move");
             actor.Health = 2;
-            CTile cautious = TacticalPlanner.ChooseMoveDestination(actor, move);
+            CTile cautious = TacticalPlanner.ChooseMoveDestination(actor, move, FrozenBudget());
             Require(cautious == start, "at low HP, the same safe starting position must not charge into ranged reach");
 
             SetField(typeof(CActor), actor, "m_ArrayIndex", healthy.m_ArrayIndex);
-            CTile retreat = TacticalPlanner.ChooseMoveDestination(actor, move);
+            CTile retreat = TacticalPlanner.ChooseMoveDestination(actor, move, FrozenBudget());
             Require(retreat != null && retreat != healthy && DistanceToEnemy(retreat, enemy) > 3 &&
                 TacticalPlanner.ThreatAt(actor, retreat.m_ArrayIndex) < TacticalPlanner.ThreatAt(actor, healthy.m_ArrayIndex),
                 "if already exposed at low HP, actual destination selection retreats out of ranged reach");
@@ -584,14 +603,14 @@ internal static class ReferenceTests
             CTile start = ScenarioManager.Tiles[actor.ArrayIndex.X, actor.ArrayIndex.Y];
             // A full-height barrier breaks every route to a firing hex without hiding the target.
             for (int y = 0; y < ScenarioManager.Height; y++) ScenarioManager.PathFinder.Nodes[5, y].Walkable = false;
-            Require(TacticalPlanner.ChooseMoveDestination(actor, move) == start,
+            Require(TacticalPlanner.ChooseMoveDestination(actor, move, FrozenBudget()) == start,
                 "a visible hostile across an impassable barrier cannot earn unverified path progress");
             for (int y = 0; y < ScenarioManager.Height; y++) ScenarioManager.PathFinder.Nodes[5, y].Walkable = true;
-            Require(TacticalPlanner.ChooseMoveDestination(actor, move) != start,
+            Require(TacticalPlanner.ChooseMoveDestination(actor, move, FrozenBudget()) != start,
                 "opening the route restores progress against the same hostile with no door");
             for (int index = 0; index < actor.CharacterClass.HandAbilityCards.Count; index++)
                 actor.CharacterClass.HandAbilityCards[index] = Card(ordinary.BottomAction.Copy(), instance: -200 - index);
-            Require(TacticalPlanner.ChooseMoveDestination(actor, move) == start,
+            Require(TacticalPlanner.ChooseMoveDestination(actor, move, FrozenBudget()) == start,
                 "without a supported future attack, movement cannot invent a melee goal");
         }, rangedEnemy: true, blockMovement: false);
     }

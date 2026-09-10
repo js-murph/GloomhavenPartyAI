@@ -4,7 +4,7 @@ Choose which mercenaries you control in an offline Gloomhaven Digital scenario a
 
 This is an unofficial community project. It is not affiliated with or endorsed by Flaming Fowl Studios, Twin Sails Interactive, Cephalofair Games, or the BepInEx project. A legally obtained copy of Gloomhaven Digital is required; no game files are distributed in this repository or its releases.
 
-The current source is a **v0.5.0 development build**, not an in-game-validated release. It adds lost-card recovery, retreat and door-readiness decisions, and threat-driven short rests to the v0.4.0 diagnostics and item support. See the [development stages](DEVELOPMENT.md) for remaining competence gaps. The tracked release artifact has not been replaced by this development build.
+The current source is a **v0.5.1 development candidate**, not an in-game-validated release. It addresses the long synchronous searches, movement backtracking, opaque short-rest handoffs, and end-turn synchronization failure observed in v0.5.0. See the [development stages](DEVELOPMENT.md) for evidence, limits, and remaining competence gaps. The tracked release artifact has not been replaced by this development build.
 
 ## Limits
 
@@ -60,7 +60,7 @@ Other settings control the decision delay, decision logging, damage automation, 
 
 During an offline scenario, click a mercenary's `AI ON` / `AI OFF` control on the initiative track to toggle automation. With a controller, focus the initiative track and press Down from that mercenary's portrait. Enabling AI can resume a supported open prompt after the configured delay. Damage prompts resume only when `AutomateDamage` is enabled.
 
-`AI WAIT` means a prompt requires manual input or an automation attempt failed. The BepInEx log records the reason. A changed prompt can resume automation; toggling off and on also requests another attempt. Ordinary scheduled decisions retain the `AI ON` label. The controller retries transient card-UI readiness for up to three seconds and stops an individual worker after fifteen seconds, without cancelling commands already submitted to the game.
+`AI HELP` means a prompt needs manual input or an automation attempt failed; it is not a calculation-progress indicator. Earlier builds called it `AI WAIT`. The BepInEx log records the reason. A changed prompt can resume automation; a transient short-rest preflight failure can also retry when its relevant UI state changes. Ordinary scheduled decisions retain the `AI ON` label. UI and worker timeouts exclude measured synchronous planner work so one bot's search does not expire another bot's wait. An uncertain submitted command is not automatically resubmitted.
 
 `Diagnostics.DeveloperMode` defaults to `false`. When enabled, it writes bounded offline JSONL captures under `BepInEx/PartyAI/diagnostics/`. It does not enable automation, upload data, or change the planner's scores. See [developer diagnostics](DEVELOPMENT.md#developer-diagnostics) for capture contents and interpretation.
 
@@ -68,16 +68,18 @@ During an offline scenario, click a mercenary's `AI ON` / `AI OFF` control on th
 
 - When enabled in an offline scenario, the configured human mercenary starts manual and the others start automated.
 - Switching AI off cancels delayed, uncommitted decisions. A choice already submitted to the game finishes before manual control resumes.
-- Bots compare printed and universal alternatives across card orientations and action orders. Movement forecasts use game path costs and line of sight; equivalent movement queries share a decision-local cache.
-- Initiative favors early action when the selected plan has useful attacks or healing, or the actor is under pressure. Otherwise it favors the later initiative. It does not inspect unrevealed monster cards.
+- Round-card preselection uses cached, cheap action estimates without planner path/LOS queries. Actual action selection shortlists up to four plans for refinement. Path/LOS and endpoint sampling share invocation-local caches and budgets: at most 32 path calls, 128 LOS calls, and 512 candidate samples, with a 50 ms deadline checked between operations. A single engine call cannot be interrupted and can overrun that deadline. Sampling can miss a stronger plan; this is not a live frame-time guarantee.
+- Initiative uses a cheap pressure/door policy rather than repeating the refined pair search. It does not inspect unrevealed monster cards.
 - After cards are revealed, bots compare supported top/bottom orientations and both action orders. Printed halves support the simple Move, single-target enemy Attack, and finite-target self/ally Heal subset, plus a narrow single-ability, permanently-lost self-recovery action. Unsupported printed halves use a universal Move 2 or Attack 2 when available; prompts that still require unsupported input remain manual.
 - Movement uses the player movement state machine and considers staying alongside reachable destinations. It scores remaining attacks, estimates exposure from visible monsters, and applies a conservative ranged-adjacency disadvantage estimate. Without a useful immediate attack, it compares retreat, ally support, and verified progress toward an attack position. Healthy actors can accept limited exposure to avoid approach stalemates; vulnerable actors favor retreat.
+- A move retains its chosen endpoint across intermediate movement prompts and stops optimizing after arrival. If the route becomes unsafe or blocked, replanning avoids previously observed positions in that same move. New actions, toggles, and scenario resets invalidate the commitment.
 - If enemy-focused movement has no usable destination, bots approach an eligible unlocked closed door. Entrances, exits, blocked doors, intact doors with health, and occupied door tiles are excluded. Route validation rejects unrevealed paths, intermediate closed doors, and unsafe trap or terrain activation; Jump and Fly receive separate landing checks. These conservative restrictions can leave movement manual or skipped where a human would choose to accept a hazard.
 - Opening a new door requires a remaining supported attack, no nearby revealed enemies, and a party that is close enough to support the opener and not resting or short of playable cards. A bot may stage before the door while waiting. This uses visible state, not the contents of the unrevealed room, and does not yet estimate every scenario-specific reason to open a door.
 - Attacks account for shields, Pierce, capped damage, disabling conditions, and whether a projected kill prevents an enemy activation. Ineffective attacks no longer receive a target-threat bonus, and excess damage is not penalized. Stun and Disarm retain value after the target has acted. Modifier draws and monster intent are still approximated rather than simulated.
 - Heals prioritize survival at 40% health or below and Poison or Wound removal. Routine healing and overhealing are discounted. The planner discourages a routine second heal and may choose the universal action instead; a second emergency heal remains eligible.
 - When the hand cannot supply two cards, partial selections are returned before choosing a rest. Bots prefer ordinary short rests under threat when enabled, and otherwise long-rest when possible. The short-rest dialog pauses other AI decisions until that specific operation finishes; unrelated dialogs are never automatically confirmed.
 - Cards to lose are ranked by intrinsic abilities, initiative, reusable-role scarcity, and the value of retaining an unused lost-card recovery. Recovery scoring accounts for actual ordinary lost cards and remaining playable turns, including recovery as the second action. Reviving Ether's fixed Dark infusion and permanent expenditure remain engine-managed. Empty recovery is not selected, and recovery does not include active or permanently-lost cards.
+- Turn completion uses the normal ready-button action instead of a direct extra pass. Owned delayed callbacks are bound to the original phase; duplicate completion clicks and passes during end-turn synchronization are rejected without skipping the game's acknowledgement.
 - With `AutomateDamage` enabled, bots accept nonlethal damage. With `PreventLethalDamage` also enabled, they lose the lowest-scored hand card if available, or the two lowest-scored discarded cards, to prevent lethal damage when possible.
 - Optional additional attack targets are declined by the baseline automation.
 - Unsupported area attacks, summons, forced movement, persistent bonuses, element consumes, dynamic values, conditional abilities, and special class mechanics are not planned. Mandatory item or active-bonus choices require manual input.
@@ -138,6 +140,8 @@ dotnet run --project tests/GameReferenceTests/GameReferenceTests.csproj \
 
 It uses local game assemblies and reads the installed rules archive; those dependencies are not bundled or available to the public CI runner. It does not test live Unity UI or execute a scenario.
 
+`tests/README.md` also describes the optional end-turn guard/IL checks and the distinction between injected-clock tests, synthetic timing measurements, and live-game validation.
+
 ## Releases
 
 The release workflow does not build the plugin because the required local Gloomhaven assemblies are not available on the GitHub runner. Instead, it packages the plugin binary tracked at `artifacts/GloomhavenPartyAI.dll`. Game dependencies are not included.
@@ -171,4 +175,4 @@ To smoke-test current behavior, run these checks in a disposable offline scenari
 
 The separate regression workflow runs the dependency-free checks. The release workflow checks version fields and creates packages from the tracked artifact; it still does not build against the game or run in-game tests. The maintainer reports completing a two-mercenary offline smoke test for `0.1.0` and manually exercising core tactical action execution in a later build.
 
-The v0.5.0 development source compiles against the locally installed game assemblies. Builds and automated checks do not launch the game or install the plugin. Recovery confirmation, short-rest UI, movement changes, item activation, and diagnostic lifecycle hooks still need user-run in-game validation. The [development guide](DEVELOPMENT.md#manual-validation) adds targeted checks for those changes.
+The v0.5.1 candidate compiles against the locally installed game assemblies. Builds and automated checks do not launch the game or install the plugin. Live callback execution, short-rest UI, planning latency, movement, and scenario completion still need user-run validation. The [development guide](DEVELOPMENT.md#manual-validation) lists targeted checks.

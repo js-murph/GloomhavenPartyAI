@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -10,6 +11,7 @@ using ScenarioRuleLibrary;
 using Script.GUI.Popups;
 using UnityEngine;
 using UnityEngine.Events;
+using UnityEngine.UI;
 
 namespace GloomhavenPartyAI
 {
@@ -26,6 +28,10 @@ namespace GloomhavenPartyAI
         private static readonly FieldInfo SecondDraw = AccessTools.Field(typeof(CardsHandUI), "shortRestAlternateLostCardID");
         private static readonly FieldInfo Previewing = AccessTools.Field(typeof(CardsHandManager), "isPreviewing");
         private static readonly FieldInfo DeckPreview = AccessTools.Field(typeof(CardsHandManager), "previewDecksWindow");
+        private static readonly FieldInfo CardViews = AccessTools.Field(typeof(CardsHandUI), "cardsUI");
+        private static readonly FieldInfo UiLocks = AccessTools.Field(typeof(UIManager), "elementsLockUI");
+        private static readonly FieldInfo RestConfirmation = AccessTools.Field(typeof(ShortRest), "yesNoDialog");
+        private static readonly FieldInfo ConfirmationWindow = AccessTools.Field(typeof(YesNoDialog), "window");
         private static readonly FieldInfo EventCalls = AccessTools.Field(typeof(UnityEventBase), "m_Calls");
         private static readonly FieldInfo RuntimeCalls = EventCalls == null ? null :
             AccessTools.Field(EventCalls.FieldType, "m_RuntimeCalls");
@@ -49,8 +55,13 @@ namespace GloomhavenPartyAI
         private static UnityAction[] _callbacks;
         private static ExtendedButton[] _buttons;
         private static object[][] _listeners;
+        private static bool _capabilityChecked, _capabilityReady;
+        private static CPlayerActor _blockedActor;
+        private static string _reportedBlock;
 
         internal static string Status { get; private set; } = "idle";
+        internal static string LastBlockReason { get; private set; } = "rest_ready";
+        internal static bool IsTransientBlock { get; private set; }
         internal static CPlayerActor Owner => _owner;
         internal static bool IsPending(CPlayerActor actor) => IsPendingAny && ReferenceEquals(actor, _owner);
         internal static bool IsPendingAny => _owner != null;
@@ -77,28 +88,24 @@ namespace GloomhavenPartyAI
             _preparing = _focusChanged = false;
             _completionDeadline = -1f;
             Status = "idle";
+            LastBlockReason = "rest_ready";
+            IsTransientBlock = false;
         }
 
         // True means an attempt was claimed, possibly still preparing; do not call TryStart again.
         // The controller must exclude ALL other party decisions while IsPendingAny is true.
         internal static bool TryStart(CPlayerActor actor)
         {
-            if (ScenarioRuleClient.s_MainThread != Thread.CurrentThread || IsPendingAny) return false;
+            if (ScenarioRuleClient.s_MainThread != Thread.CurrentThread) return false;
+            EnsureCapability();
+            if (IsPendingAny) return Block(actor, "rest_other_hand_busy", _hand, transient: false);
             Status = "not_ready";
-            if (!CanAct(actor) || Buttons == null || Content == null || RestButton == null ||
-                Rested == null || LosingCards == null || FirstDraw == null || SecondDraw == null || RuntimeCalls == null ||
-                Previewing == null || DeckPreview == null ||
-                !TargetMethods().All(method => Harmony.GetPatchInfo(method)?.Prefixes.Any(p =>
-                    p.PatchMethod.DeclaringType == typeof(ShortRestPlanner)) == true &&
-                    Harmony.GetPatchInfo(method)?.Postfixes.Any(p =>
-                    p.PatchMethod.DeclaringType == typeof(ShortRestPlanner)) == true)) return false;
+            string reason = PreflightReason(actor, prepared: false, out CardsHandUI blocker);
+            if (reason != "rest_ready") return Block(actor, reason, blocker);
+            if (!AutomationController.IsAutomated(actor)) return Block(actor, "rest_rules");
             CardsHandManager manager = CardsHandManager.Instance;
             CardsHandUI hand = manager?.GetHand(actor);
             DialogPopup popup = UIManager.Instance?.dialogPopup;
-            if (hand == null || hand.PlayerActor != actor || popup == null || !IdleUi(manager) ||
-                manager.CurrentHand == null || manager.ActivePlayer != manager.CurrentHand.PlayerActor ||
-                !manager.IsShowingPlayerHand(manager.ActivePlayer) || !manager.CurrentHand.IsInteractable ||
-                manager.CurrentHand.currentMode != CardHandMode.CardsSelection || !HandReady(hand)) return false;
             _owner = actor;
             _hand = hand;
             _manager = manager;
@@ -112,9 +119,11 @@ namespace GloomhavenPartyAI
             _prepareDeadline = Time.realtimeSinceStartup + 3f;
             _frame = Time.frameCount;
             Status = "preparing";
+            LastBlockReason = "rest_ready";
+            IsTransientBlock = false;
             try
             {
-                if (_previousHand != null)
+                if (manager.CurrentHand != hand || !manager.IsShowingPlayerHand(actor))
                 {
                     _invoking = true;
                     _expectedSwitch = actor;
@@ -125,6 +134,7 @@ namespace GloomhavenPartyAI
             {
                 Reset();
                 Status = "manual";
+                Block(actor, "rest_target_hand", transient: false);
                 Plugin.Log?.LogWarning("Short rest preparation left manual: " + exception.Message);
                 return true;
             }
@@ -148,6 +158,7 @@ namespace GloomhavenPartyAI
             {
                 Reset();
                 Status = "manual";
+                Block(actor, "rest_rules", transient: false);
                 return false;
             }
             if (_preparing) return Prepare();
@@ -175,6 +186,7 @@ namespace GloomhavenPartyAI
                 if (Time.realtimeSinceStartup < _completionDeadline) return false;
                 Reset();
                 Status = "manual";
+                Block(actor, "rest_target_hand", transient: false);
                 return true;
             }
             _completionDeadline = -1f;
@@ -185,12 +197,14 @@ namespace GloomhavenPartyAI
                 // The hand was replaced or the game reset the uncommitted rest (for example, undo).
                 Reset();
                 Status = "manual";
+                Block(actor, "rest_target_hand", transient: false);
                 return false;
             }
             if (_submitted || !CanAct(actor)) return false;
             if (!MatchesPrompt())
             {
                 Status = "manual";
+                Block(actor, "rest_modal", transient: false);
                 return false;
             }
             int option = !_redrawn && actor.Health > 1 && _options.Length == 2 &&
@@ -217,47 +231,296 @@ namespace GloomhavenPartyAI
                 (LosingCards == null || Equals(LosingCards.GetValue(hand), true));
         }
 
-        private static bool HandReady(CardsHandUI hand)
+        private static void EnsureCapability()
         {
-            ShortRest rest = RestButton.GetValue(hand) as ShortRest;
-            return hand.currentMode == CardHandMode.CardsSelection && hand.SelectedCards.Count == 0 &&
-                hand.ShortRestedCard == null && !AnimationInProgress(hand) &&
-                Equals(Rested.GetValue(hand), false) && Equals(FirstDraw.GetValue(hand), -1) &&
-                Equals(SecondDraw.GetValue(hand), -1) && rest != null && rest.PlayerActor == hand.PlayerActor &&
-                rest.Button != null && !rest.IsSelected && hand.GetCard(-1) != null && !hand.GetCard(-1).IsSelected &&
-                hand.PlayerActor.CharacterClass.DiscardedAbilityCards.All(card =>
-                    card != null && hand.GetCard(card.ID)?.fullAbilityCard != null);
+            if (_capabilityChecked) return;
+            _capabilityChecked = true;
+            _capabilityReady = true;
+            // Resolve/inspect once after PatchAll, not during every frame of a UI wait.
+            var required = new[]
+            {
+                new { Field = Buttons, Name = "DialogPopup.optionButtons" },
+                new { Field = Content, Name = "DialogPopup.contentState" },
+                new { Field = RestButton, Name = "CardsHandUI.shortRest" },
+                new { Field = Rested, Name = "CardsHandUI.shortRested" },
+                new { Field = LosingCards, Name = "CardsHandUI.animatedLosingCard" },
+                new { Field = FirstDraw, Name = "CardsHandUI.shortRestLostCardID" },
+                new { Field = SecondDraw, Name = "CardsHandUI.shortRestAlternateLostCardID" },
+                new { Field = Previewing, Name = "CardsHandManager.isPreviewing" },
+                new { Field = DeckPreview, Name = "CardsHandManager.previewDecksWindow" },
+                new { Field = CardViews, Name = "CardsHandUI.cardsUI" },
+                new { Field = UiLocks, Name = "UIManager.elementsLockUI" },
+                new { Field = RestConfirmation, Name = "ShortRest.yesNoDialog" },
+                new { Field = ConfirmationWindow, Name = "YesNoDialog.window" },
+                new { Field = EventCalls, Name = "UnityEventBase.m_Calls" },
+                new { Field = RuntimeCalls, Name = "InvokableCallList.m_RuntimeCalls" }
+            };
+            foreach (var member in required)
+                if (member.Field == null)
+                {
+                    _capabilityReady = false;
+                    Plugin.Log?.LogWarning("Short rest capability missing field: " + member.Name);
+                }
+            MethodBase[] methods = TargetMethods().ToArray();
+            foreach (string name in new[] { "Show", "Hide", "ShowLoadedContent" })
+                if (!methods.Any(method => method?.DeclaringType == typeof(DialogPopup) && method.Name == name))
+                {
+                    _capabilityReady = false;
+                    Plugin.Log?.LogWarning("Short rest capability missing method: DialogPopup." + name);
+                }
+            foreach (MethodBase method in methods)
+            {
+                var patches = method == null ? null : Harmony.GetPatchInfo(method);
+                bool prefix = patches?.Prefixes.Any(p => p.PatchMethod.DeclaringType == typeof(ShortRestPlanner)) == true;
+                bool postfix = patches?.Postfixes.Any(p => p.PatchMethod.DeclaringType == typeof(ShortRestPlanner)) == true;
+                if (!prefix || !postfix)
+                {
+                    _capabilityReady = false;
+                    Plugin.Log?.LogWarning("Short rest capability missing " +
+                        (method == null ? "method" : !prefix && !postfix ? "prefix and postfix" : !prefix ? "prefix" : "postfix") + ": " +
+                        (method == null ? "CardsHandManager.SwitchHand(CPlayerActor)" :
+                         method.DeclaringType.FullName + "." + method));
+                }
+            }
         }
 
-        private static bool IdleUi(CardsHandManager manager)
+        private static bool HasPendingDraw(CardsHandUI hand)
         {
-            return manager != null && UIManager.Instance?.dialogPopup != null &&
-                !UIManager.Instance.dialogPopup.IsOpen() && Equals(Previewing.GetValue(manager), false) &&
-                DeckPreview.GetValue(manager) is CardsHandPreviewWindow preview && !preview.IsOpen &&
-                !manager.IsFullCardPreviewShowing && manager.CardHandsUI.All(hand => hand != null &&
-                    !hand.IsPreviewingCards && !AnimationInProgress(hand) && hand.ShortRestedCard == null &&
-                    !((RestButton.GetValue(hand) as ShortRest)?.IsSelected ?? false));
+            return hand.ShortRestedCard != null || !Equals(FirstDraw.GetValue(hand), -1) ||
+                !Equals(SecondDraw.GetValue(hand), -1);
+        }
+
+        private static string UiBlock(CardsHandManager manager, out CardsHandUI blocker)
+        {
+            blocker = null;
+            if (manager == null || UIManager.Instance?.dialogPopup == null) return "rest_target_hand";
+            bool modal = UIManager.Instance.dialogPopup.IsOpen();
+            // The manager's full-preview getter aggregates hidden hand flags, not viewer visibility.
+            if (!Equals(Previewing.GetValue(manager), false) ||
+                !(DeckPreview.GetValue(manager) is CardsHandPreviewWindow preview) || preview.IsOpen ||
+                Singleton<FullCardHandViewer>.Instance?.IsActive == true) return "rest_preview";
+            // Only pending draws and genuinely live UI ownership cross hand boundaries. A hidden
+            // hand's preview/selection/rested flags do not describe the current view.
+            foreach (CardsHandUI hand in manager.CardHandsUI)
+            {
+                if (hand == null) continue;
+                ShortRest rest = RestButton.GetValue(hand) as ShortRest;
+                YesNoDialog confirmation = rest == null ? null : RestConfirmation.GetValue(rest) as YesNoDialog;
+                UIWindow window = confirmation == null ? null : ConfirmationWindow.GetValue(confirmation) as UIWindow;
+                bool visible = hand.isActiveAndEnabled && hand.gameObject.activeInHierarchy;
+                if (HasPendingDraw(hand) || (visible && AnimationInProgress(hand)) ||
+                    (window != null && window.IsOpen && window.gameObject.activeInHierarchy) ||
+                    (visible && rest != null && rest.IsSelected))
+                {
+                    blocker = hand;
+                    return modal ? "rest_modal" : "rest_other_hand_busy";
+                }
+                if (visible && hand.IsPreviewingCards)
+                {
+                    blocker = hand;
+                    return "rest_preview";
+                }
+            }
+            UIWindow focused = UIWindow.FocusedWindow;
+            if (modal || (focused != null && focused.IsPopUp && focused.IsOpen && focused.gameObject.activeInHierarchy) ||
+                !(UiLocks.GetValue(UIManager.Instance) is HashSet<GameObject> locks) || locks.Count != 0)
+                return "rest_modal";
+            return "rest_ready";
+        }
+
+        private static bool CardViewsReady(CardsHandUI hand)
+        {
+            if (hand?.PlayerActor?.CharacterClass == null ||
+                !(CardViews.GetValue(hand) is List<AbilityCardUI> views)) return false;
+            int longRest = 0;
+            foreach (AbilityCardUI view in views)
+                if (view != null && view.CardID == -1)
+                {
+                    if (!view.IsLongRest || view.PlayerActor != hand.PlayerActor) return false;
+                    longRest++;
+                }
+            if (longRest != 1) return false;
+            // PerformShortRest draws from ALL discards and GetCardUI matches AbilityCard identity,
+            // not CardType, visibility or selectability. GetCard also logs on misses, so don't poll it.
+            foreach (CAbilityCard card in hand.PlayerActor.CharacterClass.DiscardedAbilityCards)
+            {
+                if (card == null) return false;
+                int matches = 0;
+                foreach (AbilityCardUI view in views)
+                    if (view != null && view.CardID == card.ID)
+                    {
+                        if (!ReferenceEquals(view.AbilityCard, card) || view.PlayerActor != hand.PlayerActor ||
+                            view.fullAbilityCard == null) return false;
+                        matches++;
+                    }
+                if (matches != 1) return false;
+            }
+            return true;
+        }
+
+        private static string PreflightReason(CPlayerActor actor, bool prepared, out CardsHandUI blocker)
+        {
+            blocker = null;
+            if (!_capabilityReady) return "rest_capability";
+            if (ScenarioRuleClient.IsProcessingOrMessagesQueued) return "rest_queue";
+            if (!RulesReady(actor)) return "rest_rules";
+            CardsHandManager manager = CardsHandManager.Instance;
+            string reason = UiBlock(manager, out blocker);
+            if (reason == "rest_other_hand_busy" && blocker?.PlayerActor == actor) return "rest_target_hand";
+            if (reason != "rest_ready") return reason;
+            CardsHandUI hand = manager.GetHand(actor);
+            CardsHandUI current = manager.CurrentHand;
+            if (hand == null || hand.PlayerActor != actor) return "rest_target_hand";
+            if (current != null && current.isActiveAndEnabled && current.gameObject.activeInHierarchy &&
+                (manager.ActivePlayer != current.PlayerActor || current.currentMode != CardHandMode.CardsSelection))
+            {
+                blocker = current;
+                return current == hand ? "rest_target_hand" : "rest_other_hand_busy";
+            }
+            // Hidden target presentation is allowed to refresh through the game's claimed SwitchHand.
+            if (!prepared) return "rest_ready";
+            if (current != hand || manager.ActivePlayer != actor || !hand.isActiveAndEnabled ||
+                !hand.gameObject.activeInHierarchy || !manager.IsShowingPlayerHand(actor) ||
+                !hand.IsInteractable || hand.currentMode != CardHandMode.CardsSelection || hand.SelectedCards.Count != 0 ||
+                !Equals(Rested.GetValue(hand), false)) return "rest_target_hand";
+            ShortRest rest = RestButton.GetValue(hand) as ShortRest;
+            if (rest == null || rest.PlayerActor != actor || rest.Button == null || rest.IsSelected ||
+                !rest.isActiveAndEnabled || !rest.gameObject.activeInHierarchy || !rest.Button.IsInteractable())
+                return "rest_target_hand";
+            return CardViewsReady(hand) ? "rest_ready" : "rest_card_views";
+        }
+
+        private static bool IdleUi(CardsHandManager manager) => UiBlock(manager, out _) == "rest_ready";
+
+        private static bool Block(CPlayerActor actor, string reason, CardsHandUI blocker = null, bool transient = true)
+        {
+            LastBlockReason = reason;
+            IsTransientBlock = transient && reason != "rest_capability" && reason != "rest_rules";
+            if (!ReferenceEquals(_blockedActor, actor) || _reportedBlock != reason)
+            {
+                _blockedActor = actor;
+                _reportedBlock = reason;
+                if (DeveloperDiagnostics.Enabled)
+                {
+                    try
+                    {
+                        DeveloperDiagnostics.Record("short_rest_blocked", actor,
+                            "action=rest;reason=" + reason + PreflightDetail(actor, blocker, diagnostic: true));
+                    }
+                    catch (Exception exception)
+                    {
+                        Plugin.Log?.LogWarning("Short rest diagnostic snapshot unavailable: " + exception.Message);
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Main-thread, read-only polling. Save at a transient short-rest handoff and compare later;
+        // only clear that handoff when !IsPendingAny. Never use it to recover an owned/manual popup.
+        internal static string PreflightSignature(CPlayerActor actor)
+        {
+            if (ScenarioRuleClient.s_MainThread != Thread.CurrentThread) return "rest_capability";
+            string reason = PreflightReason(actor, prepared: true, out CardsHandUI blocker);
+            return reason + PreflightDetail(actor, blocker);
+        }
+
+        private static string PreflightDetail(CPlayerActor actor, CardsHandUI blocker, bool diagnostic = false)
+        {
+            CardsHandManager manager = CardsHandManager.Instance;
+            CardsHandUI hand = actor == null ? null : manager?.GetHand(actor);
+            UIManager ui = UIManager.Instance;
+            CardsHandPreviewWindow preview = manager == null ? null : DeckPreview?.GetValue(manager) as CardsHandPreviewWindow;
+            UIWindow focused = UIWindow.FocusedWindow;
+            string detail = string.Format(CultureInfo.InvariantCulture,
+                ";actor_id={0};blocking_actor_id={1};current_actor_id={2};target_actor_id={3};active_actor_id={4}" +
+                ";mode={5};queue={6};modal={7};ui_preview={8};deck_preview={9};full_preview={10};ui_locks={11};current_mode={12}",
+                actor?.ID ?? -1, blocker?.PlayerActor?.ID ?? -1, manager?.CurrentHand?.PlayerActor?.ID ?? -1,
+                hand?.PlayerActor?.ID ?? -1, manager?.ActivePlayer?.ID ?? -1,
+                hand == null ? -1 : (int)hand.currentMode, ScenarioRuleClient.IsProcessingOrMessagesQueued ? 1 : 0,
+                ui?.dialogPopup == null ? -1 : ui.dialogPopup.IsOpen() ? 1 : 0,
+                manager == null ? -1 : Equals(Previewing?.GetValue(manager), true) ? 1 : 0,
+                preview == null ? -1 : preview.IsOpen ? 1 : 0,
+                Singleton<FullCardHandViewer>.Instance == null ? -1 : Singleton<FullCardHandViewer>.Instance.IsActive ? 1 : 0,
+                ui == null ? -1 : (UiLocks?.GetValue(ui) as HashSet<GameObject>)?.Count ?? -1,
+                manager?.CurrentHand == null ? -1 : (int)manager.CurrentHand.currentMode);
+            // The diagnostics writer bounds detail to 1024 characters. Keep extended retry state
+            // out of that event; neither path walks scene objects or calls logging GetCard lookups.
+            if (diagnostic) return detail + HandDetail("target", hand, true) + HandDetail("blocking", blocker, true);
+            return detail + string.Format(CultureInfo.InvariantCulture,
+                ";phase={0};round={1};health={2};hand={3};discarded={4};round_cards={5};rules_ready={6}" +
+                ";manager_id={7};popup_id={8};focused_modal_id={9};target_card_views={10}",
+                PhaseManager.CurrentPhase == null ? -1 : (int)PhaseManager.PhaseType,
+                ScenarioManager.CurrentScenarioState?.RoundNumber ?? -1, actor?.Health ?? -1,
+                actor?.CharacterClass?.HandAbilityCards.Count ?? -1, actor?.CharacterClass?.DiscardedAbilityCards.Count ?? -1,
+                actor?.CharacterClass?.RoundAbilityCards.Count ?? -1, RulesReady(actor) ? 1 : 0,
+                manager == null ? -1 : manager.GetInstanceID(), ui?.dialogPopup == null ? -1 : ui.dialogPopup.GetInstanceID(),
+                focused != null && focused.IsPopUp && focused.IsOpen && focused.gameObject.activeInHierarchy ? focused.GetInstanceID() : -1,
+                _capabilityReady && CardViewsReady(hand) ? 1 : 0) +
+                HandDetail("target", hand) + HandDetail("current", manager?.CurrentHand) + HandDetail("blocking", blocker);
+        }
+
+        private static string HandDetail(string prefix, CardsHandUI hand, bool diagnostic = false)
+        {
+            ShortRest rest = hand == null ? null : RestButton?.GetValue(hand) as ShortRest;
+            YesNoDialog confirmation = rest == null ? null : RestConfirmation?.GetValue(rest) as YesNoDialog;
+            UIWindow window = confirmation == null ? null : ConfirmationWindow?.GetValue(confirmation) as UIWindow;
+            string detail = string.Format(CultureInfo.InvariantCulture,
+                ";{0}_hand_id={1};{0}_mode={2};{0}_rested={3};{0}_ui_rested={4};{0}_animation={5};{0}_ui_animation={6}" +
+                ";{0}_draw={7};{0}_alternate_draw={8};{0}_draw_card={9};{0}_preview={10}",
+                prefix, hand == null ? -1 : hand.GetInstanceID(), hand == null ? -1 : (int)hand.currentMode,
+                hand?.PlayerActor?.CharacterClass == null ? -1 : hand.PlayerActor.CharacterClass.HasShortRested ? 1 : 0,
+                hand == null || Rested == null ? -1 : Equals(Rested.GetValue(hand), true) ? 1 : 0,
+                hand == null ? -1 : hand.AnimatingLostCards ? 1 : 0,
+                hand == null || LosingCards == null ? -1 : Equals(LosingCards.GetValue(hand), true) ? 1 : 0,
+                hand == null ? -1 : FirstDraw?.GetValue(hand) ?? -1, hand == null ? -1 : SecondDraw?.GetValue(hand) ?? -1,
+                hand?.ShortRestedCard?.ID ?? -1, hand == null ? -1 : hand.IsPreviewingCards ? 1 : 0);
+            if (diagnostic) return detail;
+            return detail + string.Format(CultureInfo.InvariantCulture,
+                ";{0}_visible={1};{0}_interactable={2};{0}_selected={3};{0}_rest_selected={4};{0}_rest_visible={5}" +
+                ";{0}_rest_interactable={6};{0}_rest_actor_id={7};{0}_confirmation={8};{0}_showing={9}", prefix,
+                hand != null && hand.isActiveAndEnabled && hand.gameObject.activeInHierarchy ? 1 : 0,
+                hand == null ? -1 : hand.IsInteractable ? 1 : 0, hand?.SelectedCards?.Count ?? -1,
+                rest == null ? -1 : rest.IsSelected ? 1 : 0,
+                rest != null && rest.isActiveAndEnabled && rest.gameObject.activeInHierarchy ? 1 : 0,
+                rest?.Button == null ? -1 : rest.Button.IsInteractable() ? 1 : 0, rest?.PlayerActor?.ID ?? -1,
+                window != null && window.IsOpen && window.gameObject.activeInHierarchy ? 1 : 0,
+                hand != null && CardsHandManager.Instance?.IsShowingPlayerHand(hand.PlayerActor) == true ? 1 : 0);
         }
 
         private static bool Prepare()
         {
-            if (Time.realtimeSinceStartup >= _prepareDeadline || _focusChanged || _hand == null ||
+            if (_focusChanged || _hand == null ||
                 CardsHandManager.Instance != _manager || _manager.CurrentHand != _hand ||
                 _manager.ActivePlayer != _owner || UIManager.Instance?.dialogPopup != _popup ||
                 !ReferenceEquals(_scenario, ScenarioManager.CurrentScenarioState) ||
                 ScenarioManager.CurrentScenarioState.RoundNumber != _round || _owner.Health != _health ||
                 PhaseManager.PhaseType != CPhase.PhaseType.SelectAbilityCardsOrLongRest ||
-                !_owner.CharacterClass.DiscardedAbilityCards.SequenceEqual(_discards) || !HandReady(_hand))
+                !_owner.CharacterClass.DiscardedAbilityCards.SequenceEqual(_discards))
             {
                 // No random draw has occurred: release the preparation lock and let the caller hand off.
+                CPlayerActor actor = _owner;
                 Reset();
                 Status = "manual";
+                Block(actor, "rest_target_hand", transient: false);
                 return false;
             }
-            if (!CanAct(_owner) || !IdleUi(_manager) || !_manager.IsShowingPlayerHand(_owner) ||
-                !_hand.IsInteractable) return false;
-            ShortRest rest = (ShortRest)RestButton.GetValue(_hand);
-            if (!rest.gameObject.activeInHierarchy || !rest.Button.IsInteractable()) return false;
+            string reason = PreflightReason(_owner, prepared: true, out CardsHandUI blocker);
+            if (reason == "rest_ready" && !AutomationController.IsAutomated(_owner)) reason = "rest_rules";
+            if (reason != "rest_ready")
+            {
+                CPlayerActor actor = _owner;
+                if (Time.realtimeSinceStartup >= _prepareDeadline || reason == "rest_rules" || reason == "rest_capability")
+                {
+                    Reset();
+                    Status = "manual";
+                }
+                return Block(actor, reason, blocker);
+            }
+            LastBlockReason = "rest_ready";
+            IsTransientBlock = false;
+            _blockedActor = null;
+            _reportedBlock = null;
             _preparing = false;
             InvokeUi(() => _hand.PerformShortRest(_owner));
             return true;
@@ -299,9 +562,15 @@ namespace GloomhavenPartyAI
 
         private static bool CanAct(CPlayerActor actor)
         {
-            return Plugin.AutomateShortRests.Value && actor?.CharacterClass != null && !actor.IsDead && actor.Health > 0 &&
-                !actor.IsTakingExtraTurn && !FFSNetwork.IsOnline && AutomationController.IsAutomated(actor) &&
-                AutomationController.IsScenarioReady() && !ScenarioRuleClient.IsProcessingOrMessagesQueued &&
+            return RulesReady(actor) && AutomationController.IsAutomated(actor) &&
+                !ScenarioRuleClient.IsProcessingOrMessagesQueued;
+        }
+
+        private static bool RulesReady(CPlayerActor actor)
+        {
+            return Plugin.AutomateShortRests?.Value == true && actor?.CharacterClass != null && !actor.IsDead && actor.Health > 0 &&
+                !actor.IsTakingExtraTurn && !FFSNetwork.IsOnline && AutomationController.IsScenarioReady() &&
+                ScenarioManager.CurrentScenarioState != null &&
                 PhaseManager.PhaseType == CPhase.PhaseType.SelectAbilityCardsOrLongRest &&
                 !actor.CharacterClass.ImprovedShortRest && !actor.CharacterClass.LongRest &&
                 !actor.IsLongRestSelected && !actor.CharacterClass.HasShortRested &&
@@ -320,10 +589,17 @@ namespace GloomhavenPartyAI
                 action();
                 Status = _submitted ? "submitted" : _shows == 1 && MatchesPrompt() ?
                     (_redrawn ? "redrawn" : "started") : "manual";
+                if (Status == "manual") Block(_owner, "rest_modal", transient: false);
+                else
+                {
+                    LastBlockReason = "rest_ready";
+                    IsTransientBlock = false;
+                }
             }
             catch (Exception exception)
             {
                 Status = "manual";
+                Block(_owner, "rest_modal", transient: false);
                 Plugin.Log?.LogWarning("Short rest left manual: " + exception.Message);
             }
             finally

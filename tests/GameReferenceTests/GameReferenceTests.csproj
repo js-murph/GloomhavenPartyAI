@@ -19,6 +19,7 @@
     <Compile Include="../../RecoveryPlanner.cs" Link="RecoveryPlanner.cs" />
     <Compile Include="../../RecoveryEvaluation.cs" Link="RecoveryEvaluation.cs" />
     <Compile Include="../../TacticalPlanner.cs" Link="TacticalPlanner.cs" />
+    <Compile Include="../../PlanningBudget.cs" Link="PlanningBudget.cs" />
     <Compile Include="../../TacticalEvaluation.cs" Link="TacticalEvaluation.cs" />
     <Compile Include="../../SurvivalEvaluation.cs" Link="SurvivalEvaluation.cs" />
     <Reference Include="ScenarioRuleLibrary" HintPath="$(ManagedDir)/ScenarioRuleLibrary.dll" Private="false" />
