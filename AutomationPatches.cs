@@ -16,7 +16,10 @@ namespace GloomhavenPartyAI
         {
             // Capture error notifications before the original handler opens its blocking dialog.
             if (ScenarioRuleClient.s_MainThread == Thread.CurrentThread)
+            {
+                AutomationController.ObserveFault(message);
                 DeveloperDiagnostics.ObserveMessage(message);
+            }
         }
 
         [HarmonyPatch(typeof(Choreographer), nameof(Choreographer.LogScenarioResult))]
@@ -106,14 +109,10 @@ namespace GloomhavenPartyAI
                 return true;
             }
 
-            List<CActor> valid = __instance.ValidActorsInRange
-                .Where(a => a != null && !a.IsDead)
-                .OrderByDescending(a => TacticalPlanner.ScoreAttackTarget(__instance.TargetingActor, a, __instance))
-                .ThenBy(a => FocusRank(__instance.TargetingActor, a))
-                .ThenBy(a => SharedAbilityTargeting.GetDistanceBetweenActorsInHexes(a, __instance.TargetingActor))
-                .ThenBy(a => a.Initiative())
-                .ThenBy(a => a.ID)
-                .ToList();
+            List<CActor> valid = TacticalPlanner.RankAttackTargets(__instance.TargetingActor,
+                __instance, __instance.ValidActorsInRange);
+            if (valid.Count == 0)
+                valid = __instance.ValidActorsInRange.Where(actor => actor != null && !actor.IsDead).Take(1).ToList();
 
             if (valid.Count == 0)
             {
@@ -138,10 +137,5 @@ namespace GloomhavenPartyAI
             return true;
         }
 
-        private static int FocusRank(CActor attacker, CActor target)
-        {
-            int index = attacker.AIMoveFocusActors.IndexOf(target);
-            return index < 0 ? int.MaxValue : index;
-        }
     }
 }
